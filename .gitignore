@@ -1,0 +1,19 @@
+# Local configuration file
+launcher_config.json
+
+# Temporary mod download
+mods_temp.zip
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Log files (optional, but good practice)
+logs/
+*.log
+*.log.gz
+
+# VS Code settings (optional)
+.vscode/
