@@ -225,24 +225,65 @@ def perform_install_update_launch():
 
         # 4. Check/Install Vanilla Minecraft
         update_status(f"Checking/Installing Minecraft {mc_version}...")
-        minecraft_launcher_lib.install.install_minecraft_version(mc_version, str(MINECRAFT_DIR), callback=callback_handler)
-        update_status(f"Minecraft {mc_version} installed.", progress=current_progress / max_progress * 100 if max_progress else 30) # Estimate progress
+        try:
+            minecraft_launcher_lib.install.install_minecraft_version(
+                mc_version, 
+                str(MINECRAFT_DIR), 
+                callback={
+                    "setStatus": lambda text: update_status(f"Installing {mc_version}: {text}"),
+                    "setProgress": lambda progress: update_progress_bar(progress),
+                    "setMax": set_progress_max
+                }
+            )
+            update_status(f"Minecraft {mc_version} installed successfully.", progress=30)
+        except Exception as e:
+            print(f"Error installing Minecraft {mc_version}: {e}")
+            update_status(f"Error installing Minecraft {mc_version}: {e}")
+            # Try to continue with existing version if available
+            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(MINECRAFT_DIR))
+            if not any(v['id'] == mc_version for v in installed_versions):
+                raise ValueError(f"Could not install Minecraft {mc_version} and no existing version found")
+            update_status(f"Using existing Minecraft {mc_version} installation", progress=30)
 
         # 5. Check/Install Loader (Forge/Fabric)
         version_id = mc_version # Default to vanilla
         if loader_type == "forge" and loader_version:
-            version_id = f"{mc_version}-forge-{loader_version}"
-            update_status(f"Checking/Installing Forge {loader_version} for {mc_version} (ID: {version_id})...")
-            print(f"Attempting to install Forge with version_id: {version_id}") # Debug print
+            # Modern Forge versions (1.13+) use different format
+            version_id = f"{mc_version}-forge-{loader_version}"  # Still used for version ID
+            update_status(f"Checking/Installing Forge {loader_version} for {mc_version}...")
+            
+            update_status(f"Installing Forge {loader_version} from official source...")
             try:
-                minecraft_launcher_lib.forge.install_forge_version(version_id, str(MINECRAFT_DIR), callback=callback_handler)
-                update_status(f"Forge {loader_version} installed.", progress=current_progress / max_progress * 100 if max_progress else 60)
+                # Download and run the official Forge installer
+                installer_url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_version}-{loader_version}/forge-{mc_version}-{loader_version}-installer.jar"
+                installer_path = MINECRAFT_DIR / f"forge-{mc_version}-{loader_version}-installer.jar"
+                
+                update_status("Downloading Forge installer...")
+                response = requests.get(installer_url, stream=True)
+                response.raise_for_status()
+                with open(installer_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                update_status("Running Forge installer...")
+                subprocess.run([
+                    "java",
+                    "-jar",
+                    str(installer_path),
+                    "--installServer" if os.name == 'nt' else "--installClient",
+                    str(MINECRAFT_DIR)
+                ], check=True)
+                
+                # Clean up installer
+                installer_path.unlink()
+                
+                update_status(f"Forge {loader_version} installed successfully.", progress=60)
             except Exception as e:
-                # Catch potential install error specifically here
-                print(f"Error installing Forge version {version_id}: {e}")
-                update_status(f"Error installing Forge {loader_version}: {e}. Check version format/availability.")
-                # Re-raise or handle as needed - for now, let the main try/except catch it to stop the process
-                raise e # Propagate error to the main handler
+                print(f"Error installing Forge via installer: {e}")
+                update_status(f"Failed to install Forge {loader_version}: {e}")
+                if installer_path.exists():
+                    installer_path.unlink()
+                raise ValueError(f"Could not install Forge {loader_version}")
         elif loader_type == "fabric" and loader_version:
             # Fabric version ID might just be mc_version, but install_fabric needs loader version
             update_status(f"Checking/Installing Fabric {loader_version} for {mc_version}...")
@@ -331,20 +372,29 @@ def perform_install_update_launch():
 
 
         # 7. Launch Game
+        # For Forge versions, we need to find the actual installed version ID
+        if loader_type == "forge" and loader_version:
+            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(MINECRAFT_DIR))
+            for v in installed_versions:
+                if v['type'] == 'release' and mc_version in v['id'] and 'forge' in v['id']:
+                    version_id = v['id']
+                    break
+
         update_status(f"Preparing to launch Minecraft {version_id} as {nickname}...")
 
         options = {
             "username": nickname,
             # Generate offline UUID based on username (consistent across launches)
             "uuid": str(uuid.uuid3(uuid.NAMESPACE_DNS, nickname)),
-            "token": "0" # Offline mode token
-            # Add other options if needed (JVM args, etc.)
-            # "jvmArguments": ["-Xmx2G", "-Xms2G"],
-            # "gameDirectory": str(MINECRAFT_DIR), # Usually inferred
-            # "launcherVersion": "MyLauncherName"
+            "token": "0", # Offline mode token
+            "jvmArguments": launcher_config.get("jvm_args", []) # Use jvm_args from config if specified
         }
 
-        minecraft_command = minecraft_launcher_lib.command.get_minecraft_command(version_id, str(MINECRAFT_DIR), options)
+        try:
+            minecraft_command = minecraft_launcher_lib.command.get_minecraft_command(version_id, str(MINECRAFT_DIR), options)
+        except Exception as e:
+            update_status(f"Error creating launch command: {e}")
+            raise ValueError(f"Could not create launch command for {version_id}")
 
         update_status(f"Launching Minecraft...")
         progress_var.set(100)
