@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, font as tkFont # Renamed for clarity
 import os
 import json
 import requests
@@ -12,900 +13,1344 @@ from pathlib import Path
 import uuid
 import logging
 import time
-import shutil # Import shutil for rmtree
-import tkinter.font # Import the font module
+import shutil
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Optional, Dict, Any, List, Tuple, Callable
 
 # --- Setup Logging ---
+log_file = Path("launcher.log")
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='launcher.log',
-    filemode='a' # Append to the log file
+    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, mode='a', encoding='utf-8'), # Append to the log file
+        logging.StreamHandler() # Also log to console
+    ]
 )
-# Also log to console for immediate feedback
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logging.getLogger('').addHandler(console_handler)
-
+logging.info("="*10 + " Launcher Started " + "="*10)
 
 # --- Constants ---
 CONFIG_URL = "https://gist.github.com/kuperjamper13/8f7402f86dfbc5b792dd4eda1a81c3ff/raw/launcher_config.json"
-# Determine Minecraft directory based on OS
-if os.name == 'nt': # Windows
-    MINECRAFT_DIR = Path(os.getenv('APPDATA')) / '.minecraft'
-elif os.name == 'posix': # macOS/Linux
-    MINECRAFT_DIR = Path.home() / 'Library/Application Support/minecraft' # macOS default
-    if not MINECRAFT_DIR.exists(): # Check Linux default if macOS doesn't exist
-        MINECRAFT_DIR = Path.home() / '.minecraft'
-else:
-    # Fallback or raise error for unsupported OS
-    print("Unsupported operating system!")
-    MINECRAFT_DIR = Path.cwd() / '.minecraft' # Default to current dir if unsure
-
-MODS_DIR = MINECRAFT_DIR / 'mods'
 LOCAL_CONFIG_FILE = Path("launcher_config.json") # Store local settings in the launcher's directory
 
-# --- Global Variables ---
-# It's generally better to pass config around or use a class,
-# but for this simple script, globals are acceptable.
-launcher_config = {}  # To store fetched config from Gist
-local_config = {"nickname": "", "installed_launcher_version": 0}  # Default local settings
+# --- Determine Minecraft Directory ---
+def get_minecraft_directory() -> Path:
+    """Determines the default Minecraft directory based on the operating system."""
+    if os.name == 'nt': # Windows
+        mc_dir = Path(os.getenv('APPDATA', '')) / '.minecraft'
+    elif os.name == 'posix': # macOS/Linux
+        mc_dir = Path.home() / 'Library/Application Support/minecraft' # macOS default
+        if not mc_dir.exists(): # Check Linux default if macOS doesn't exist
+            mc_dir = Path.home() / '.minecraft'
+    else:
+        logging.warning("Unsupported operating system! Using current directory for .minecraft.")
+        mc_dir = Path.cwd() / '.minecraft' # Default to current dir if unsure
 
-# --- GUI Setup ---
+    logging.info(f"Determined Minecraft directory: {mc_dir}")
+    return mc_dir
 
-# Style Configuration
+MINECRAFT_DIR = get_minecraft_directory()
+MODS_DIR = MINECRAFT_DIR / 'mods' # Note: This might be overridden if instance dir is used later
+
+# --- GUI Styling Constants ---
 BG_COLOR = "#2E2E2E"
 FG_COLOR = "#F0F0F0"
 ENTRY_BG = "#3E3E3E"
 ENTRY_FG = "#FFFFFF"
 BUTTON_BG = "#4CAF50" # Green accent
 BUTTON_FG = "#FFFFFF"
+BUTTON_ACTIVE_BG = "#45a049" # Slightly darker green on click
 FONT_FAMILY = "Segoe UI" # Or "Calibri", "Arial" - adjust as needed
 FONT_SIZE_NORMAL = 11
 FONT_SIZE_LARGE = 14
 
-root = tk.Tk()
-root.title("Minecraft Launcher")
-root.geometry("800x600") # Increased size
-root.configure(bg=BG_COLOR)
+# --- Launcher Core Logic ---
 
-# --- Main Frame for Centering ---
-main_frame = tk.Frame(root, bg=BG_COLOR)
-# Pack the main frame to expand and fill, allowing content centering
-main_frame.pack(expand=True, fill=tk.BOTH, padx=20, pady=20)
+class LauncherCore:
+    """Handles the core logic of fetching config, installing, updating, and launching Minecraft."""
 
-# Configure default font (optional, but can help consistency)
-default_font = tk.font.nametofont("TkDefaultFont")
-default_font.configure(family=FONT_FAMILY, size=FONT_SIZE_NORMAL)
-root.option_add("*Font", default_font)
+    def __init__(self, status_callback: Callable[[str, Optional[float], bool], None]):
+        """
+        Initializes the LauncherCore.
 
-# --- Input Section ---
-input_frame = tk.Frame(main_frame, bg=BG_COLOR)
-input_frame.pack(pady=(50, 20)) # Add padding above
+        Args:
+            status_callback: A function to call for updating GUI status and progress.
+                             Expected signature: callback(message: str, progress: Optional[float], is_error: bool)
+        """
+        self.status_callback = status_callback
+        self.launcher_config: Dict[str, Any] = {}
+        self.local_config: Dict[str, Any] = {"nickname": "", "installed_launcher_version": 0}
+        self.minecraft_dir = MINECRAFT_DIR
+        self.mods_dir = MODS_DIR # Default, might be changed if instance dir is implemented
+        self._stop_event = threading.Event() # For potential future cancellation
 
-# Nickname Label
-nickname_label = tk.Label(input_frame, text="Nickname:", bg=BG_COLOR, fg=FG_COLOR, font=(FONT_FAMILY, FONT_SIZE_LARGE))
-nickname_label.pack(pady=(10, 5))
+        # Shared state for minecraft-launcher-lib callbacks (needs care with threading)
+        self._lib_callback_lock = threading.Lock()
+        self._lib_max_progress = 0
+        self._lib_current_progress = 0
+        self._lib_current_status = ""
+        # State for mapping library progress to GUI progress bar segments
+        self._current_task_progress_start = 0.0
+        self._current_task_progress_end = 100.0
+        self._current_task_base_status = ""
 
-# Nickname Entry
-nickname_var = tk.StringVar()
-# Use tk.Entry for easier background/foreground color control than ttk.Entry
-nickname_entry = tk.Entry(input_frame, textvariable=nickname_var, width=40,
-                          bg=ENTRY_BG, fg=ENTRY_FG, relief=tk.FLAT, # Flat look
-                          insertbackground=ENTRY_FG, # Cursor color
-                          font=(FONT_FAMILY, FONT_SIZE_NORMAL))
-nickname_entry.pack(pady=(0, 20))
+    def _update_status(self, message: str, progress: Optional[float] = None, is_error: bool = False, is_lib_update: bool = False):
+        """
+        Safely updates the status via the callback and logs the message.
 
-# --- Action Button ---
-# Use tk.Button for easier color control
-action_button = tk.Button(main_frame, text="Install / Play / Update",
-                          command=lambda: start_action_thread(),
-                          bg=BUTTON_BG, fg=BUTTON_FG, relief=tk.FLAT,
-                          activebackground="#45a049", # Slightly darker green on click
-                          activeforeground=BUTTON_FG,
-                          font=(FONT_FAMILY, FONT_SIZE_LARGE),
-                          padx=20, pady=10) # Add padding inside button
-action_button.pack(pady=20)
+        Args:
+            message: The status message to display.
+            progress: The absolute progress value (0-100) for the main bar.
+                      If None, the progress bar is not updated.
+            is_error: If True, logs the message as an error.
+            is_lib_update: If True, indicates the update comes from a library callback.
+        """
+        log_prefix = "Lib Status: " if is_lib_update else "Status Update: "
+        if is_error:
+            logging.error(f"{log_prefix}{message}")
+        else:
+            # Avoid logging overly repetitive lib status updates unless it's an error
+            if not is_lib_update or self._lib_current_status != message:
+                 logging.info(f"{log_prefix}{message}")
 
-# --- Status Section (at the bottom) ---
-status_frame = tk.Frame(root, bg=BG_COLOR)
-# Pack the status frame at the bottom, filling X
-status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=10)
-
-# Status Label
-status_var = tk.StringVar()
-status_var.set("Ready.")
-status_label = tk.Label(status_frame, textvariable=status_var, wraplength=760, # Adjust wrap length
-                         bg=BG_COLOR, fg=FG_COLOR, justify=tk.LEFT,
-                         font=(FONT_FAMILY, FONT_SIZE_NORMAL))
-status_label.pack(pady=(5, 5), fill=tk.X) # Fill horizontally
-
-# Progress Bar
-# Use ttk.Style for Progressbar customization
-style = ttk.Style()
-# Configure TProgressbar style (may vary slightly by OS theme)
-style.theme_use('clam') # 'clam', 'alt', 'default', 'classic' - experiment if needed
-style.configure("green.Horizontal.TProgressbar", troughcolor=ENTRY_BG, bordercolor=ENTRY_BG, background=BUTTON_BG, lightcolor=BUTTON_BG, darkcolor=BUTTON_BG)
-
-progress_var = tk.DoubleVar()
-progress_bar = ttk.Progressbar(status_frame, variable=progress_var, maximum=100, length=760, style="green.Horizontal.TProgressbar")
-progress_bar.pack(pady=(5, 10), fill=tk.X) # Fill horizontally
+        # Schedule the GUI update on the main thread
+        # Use root.after to ensure it runs in the main Tkinter thread
+        if 'root' in globals(): # Check if root window exists (for safety)
+             root.after(0, self.status_callback, message, progress, is_error)
+        else:
+             # Fallback if root isn't available (e.g., testing without GUI)
+             self.status_callback(message, progress, is_error)
 
 
-# --- Core Functions ---
+    # --- minecraft-launcher-lib Callback Functions ---
+    def _set_task_progress_range(self, start: float, end: float, base_status: str):
+        """Sets the expected progress range (0-100) for the current library task."""
+        with self._lib_callback_lock:
+            self._current_task_progress_start = start
+            self._current_task_progress_end = end
+            self._current_task_base_status = base_status
+            self._lib_max_progress = 0 # Reset max for the new task
+            self._lib_current_progress = 0
+            self._lib_current_status = ""
+            # Update GUI immediately with the base status and start progress
+            self._update_status(base_status, progress=start, is_lib_update=False)
 
-def update_status(message, progress=None, is_error=False):
-    """Updates the status label and optionally the progress bar. Logs messages."""
-    status_var.set(message)
-    if progress is not None:
-        progress_var.set(progress)
-    # Log messages appropriately
-    if is_error:
-        logging.error(f"Status Update: {message}")
-    else:
-        logging.info(f"Status Update: {message}")
-    root.update_idletasks()  # Force GUI update
+    def _callback_set_status(self, text: str):
+        """Callback for library status updates. Updates GUI status."""
+        with self._lib_callback_lock:
+            self._lib_current_status = text
+            # Combine base status with library detail
+            full_status = f"{self._current_task_base_status}: {text}"
+            # Calculate current progress within the allocated range
+            current_progress = self._current_task_progress_start
+            if self._lib_max_progress > 0 and self._lib_current_progress > 0:
+                 # Calculate percentage within the library task
+                lib_percent = (self._lib_current_progress / self._lib_max_progress)
+                # Map to the allocated range on the main progress bar
+                current_progress = self._current_task_progress_start + lib_percent * (self._current_task_progress_end - self._current_task_progress_start)
 
-# --- minecraft-launcher-lib Callback Functions ---
-# Simplified progress handling for library callbacks
+            self._update_status(full_status, progress=current_progress, is_lib_update=True)
 
-_lib_max_progress = 0
-_lib_current_progress = 0
+    def _callback_set_progress(self, value: int):
+        """Callback for library progress updates. Updates GUI progress."""
+        with self._lib_callback_lock:
+            self._lib_current_progress = value
+            current_progress = self._current_task_progress_start # Default to start if max is 0
 
-def _callback_set_status(text):
-    """Callback for library status updates."""
-    # Don't overwrite major step status, just log library details
-    logging.info(f"Lib Status: {text}")
-    # Optionally, could show this in a secondary label if needed
+            if self._lib_max_progress > 0:
+                # Calculate percentage within the library task
+                lib_percent = (value / self._lib_max_progress)
+                # Map to the allocated range on the main progress bar
+                current_progress = self._current_task_progress_start + lib_percent * (self._current_task_progress_end - self._current_task_progress_start)
+                # Log detailed progress less frequently to avoid spamming logs
+                # if value % (self._lib_max_progress // 10 if self._lib_max_progress > 10 else 1) == 0 or value == self._lib_max_progress:
+                #      logging.info(f"Lib Progress: {value}/{self._lib_max_progress} ({lib_percent*100:.1f}%) -> GUI: {current_progress:.1f}%")
+            else:
+                # logging.info(f"Lib Progress: {value}/? -> GUI: {current_progress:.1f}%")
+                pass # Avoid logging if max is 0
 
-def _callback_set_progress(value):
-    """Callback for library progress updates."""
-    global _lib_current_progress
-    _lib_current_progress = value
-    # We won't directly update the main progress bar here,
-    # as it's driven by major steps. We log it instead.
-    if _lib_max_progress > 0:
-        logging.info(f"Lib Progress: {value}/{_lib_max_progress} ({(value / _lib_max_progress * 100):.1f}%)")
-    else:
-        logging.info(f"Lib Progress: {value}/?")
+            # Combine base status with current library status (if any)
+            status_detail = f": {self._lib_current_status}" if self._lib_current_status else ""
+            full_status = f"{self._current_task_base_status}{status_detail}"
+            self._update_status(full_status, progress=current_progress, is_lib_update=True)
 
 
-def _callback_set_max(value):
-    """Callback for library max progress value."""
-    global _lib_max_progress, _lib_current_progress
-    _lib_max_progress = value
-    _lib_current_progress = 0 # Reset progress for this step
-    logging.info(f"Lib Max Set: {value}")
+    def _callback_set_max(self, value: int):
+        """Callback for library max progress value."""
+        with self._lib_callback_lock:
+            # Ignore max value of 0, can happen sometimes
+            if value <= 0:
+                logging.warning(f"Lib Max Set ignored: {value}")
+                return
+            self._lib_max_progress = value
+            self._lib_current_progress = 0 # Reset progress for this step
+            logging.info(f"Lib Max Set: {value}")
+            # Update status immediately, showing 0 progress for the new max
+            status_detail = f": {self._lib_current_status}" if self._lib_current_status else ""
+            full_status = f"{self._current_task_base_status}{status_detail}"
+            self._update_status(full_status, progress=self._current_task_progress_start, is_lib_update=True)
 
-# Dictionary for passing callbacks to the library
-LIB_CALLBACKS = {
-    "setStatus": _callback_set_status,
-    "setProgress": _callback_set_progress,
-    "setMax": _callback_set_max
-}
+    @property
+    def lib_callbacks(self) -> Dict[str, Callable]:
+        """ Returns the dictionary of callbacks for minecraft-launcher-lib. """
+        return {
+            "setStatus": self._callback_set_status,
+            "setProgress": self._callback_set_progress,
+            "setMax": self._callback_set_max
+        }
 
-# --- Configuration Handling ---
-
-def load_local_config():
-    """Loads nickname and installed version from local file."""
-    global local_config
-    if LOCAL_CONFIG_FILE.exists():
-        logging.info(f"Attempting to load local config from {LOCAL_CONFIG_FILE}")
-        try:
-            with open(LOCAL_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                loaded_data = json.load(f)
-                # Validate basic structure if necessary
+    # --- Configuration Handling ---
+    def load_local_config(self) -> Dict[str, Any]:
+        """Loads nickname, installed version, gist_url, and max_ram from local file."""
+        # Define defaults
+        defaults = {
+            "nickname": "",
+            "installed_launcher_version": 0,
+            "gist_url": CONFIG_URL, # Default to the hardcoded constant
+            "max_ram": "4G" # Default RAM
+        }
+        if LOCAL_CONFIG_FILE.exists():
+            logging.info(f"Attempting to load local config from {LOCAL_CONFIG_FILE}")
+            try:
+                with open(LOCAL_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    loaded_data = json.load(f)
                 if isinstance(loaded_data, dict):
-                    local_config = loaded_data
-                    nickname_var.set(local_config.get("nickname", ""))
-                    logging.info(f"Loaded local config: {local_config}")
+                    # Merge loaded data with defaults, ensuring all keys exist
+                    self.local_config = {**defaults, **loaded_data}
+                    logging.info(f"Loaded local config: {self.local_config}")
                 else:
                     logging.warning("Local config file has invalid format. Using defaults.")
-                    local_config = {"nickname": "", "installed_launcher_version": 0} # Reset
-        except json.JSONDecodeError as e:
-            logging.error(f"Error decoding local config file {LOCAL_CONFIG_FILE}: {e}. Using defaults.")
-            update_status(f"Error reading local config: {e}", is_error=True)
-            local_config = {"nickname": "", "installed_launcher_version": 0} # Reset
-        except Exception as e:
-            logging.exception(f"Unexpected error loading local config: {e}")
-            update_status(f"Error loading config: {e}", is_error=True)
-            local_config = {"nickname": "", "installed_launcher_version": 0} # Reset
-    else:
-        logging.info("Local config file not found. Using defaults.")
-
-def save_local_config():
-    """Saves current nickname and installed version to local file."""
-    global local_config
-    current_nickname = nickname_var.get().strip()
-    if not current_nickname:
-        logging.warning("Attempted to save empty nickname. Skipping save.")
-        # Optionally inform the user, though validation should happen before calling this
-        return False # Indicate save failed due to validation
-
-    local_config["nickname"] = current_nickname
-    # installed_launcher_version is updated elsewhere before saving
-
-    logging.info(f"Attempting to save local config: {local_config}")
-    try:
-        with open(LOCAL_CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(local_config, f, indent=4)
-        logging.info("Local config saved successfully.")
-        return True
-    except Exception as e:
-        logging.exception(f"Error saving local config to {LOCAL_CONFIG_FILE}: {e}")
-        update_status(f"Error saving config: {e}", is_error=True)
-        return False
-
-def fetch_launcher_config():
-    """Fetches the latest config from the Gist URL."""
-    global launcher_config
-    update_status("Fetching remote configuration...", progress=5)
-    try:
-        # Add a timestamp to the URL to try and bypass caches
-        timestamp = int(time.time())
-        url_with_timestamp = f"{CONFIG_URL}?t={timestamp}"
-        logging.info(f"Fetching config from: {url_with_timestamp}")
-
-        # Use cache-control headers
-        headers = {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
-        response = requests.get(url_with_timestamp, headers=headers, timeout=20) # Slightly longer timeout
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
-        launcher_config = response.json()
-        logging.info(f"Fetched remote config: {launcher_config}")
-        update_status("Remote configuration fetched successfully.", progress=10)
-        return True
-    except requests.exceptions.Timeout:
-        logging.error("Timeout occurred while fetching remote config.")
-        update_status("Error: Timeout fetching remote configuration.", is_error=True)
-        launcher_config = {}
-        return False
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching remote config: {e}")
-        update_status(f"Error fetching remote config: {e}", is_error=True)
-        launcher_config = {} # Reset config on error
-        return False
-    except json.JSONDecodeError as e:
-        logging.error(f"Error decoding remote config JSON: {e}")
-        update_status("Error: Invalid format in remote configuration file.", is_error=True)
-        launcher_config = {}
-        return False
-    except Exception as e:
-        logging.exception("An unexpected error occurred during config fetch.")
-        update_status(f"An unexpected error occurred: {e}", is_error=True)
-        launcher_config = {}
-        return False
-
-
-# --- Installation/Update/Launch Steps ---
-
-def _ensure_directories():
-    """Ensures Minecraft and Mods directories exist."""
-    try:
-        update_status("Checking Minecraft directory...", progress=12)
-        MINECRAFT_DIR.mkdir(parents=True, exist_ok=True)
-        MODS_DIR.mkdir(parents=True, exist_ok=True) # Ensure mods dir also exists early
-        logging.info(f"Ensured Minecraft directory exists: {MINECRAFT_DIR}")
-        logging.info(f"Ensured Mods directory exists: {MODS_DIR}")
-        return True
-    except OSError as e:
-        logging.exception(f"Error creating directories: {e}")
-        update_status(f"Error creating directories: {e}", is_error=True)
-        return False
-
-# Note: There were two identical definitions of _install_minecraft_version.
-# I've kept only one, assuming it was an accidental duplication.
-def _install_minecraft_version(mc_version, max_retries=5, retry_delay=10): # Increased retry_delay to 10 seconds
-    """Installs the specified vanilla Minecraft version with retries."""
-    update_status(f"Checking/Installing Minecraft {mc_version}...", progress=15)
-
-    last_exception = None
-    for attempt in range(1, max_retries + 1):
-        logging.info(f"Attempt {attempt}/{max_retries} to install Minecraft {mc_version}...")
-        if attempt > 1:
-            update_status(f"Retrying Minecraft {mc_version} install (Attempt {attempt}/{max_retries})...", progress=15 + attempt) # Slightly bump progress
-            time.sleep(retry_delay) # Wait before retrying
-
-        try:
-            logging.info(f"Calling minecraft_launcher_lib.install.install_minecraft_version for {mc_version} (Attempt {attempt})")
-            minecraft_launcher_lib.install.install_minecraft_version(
-                mc_version,
-                str(MINECRAFT_DIR),
-                callback=LIB_CALLBACKS  # Use the defined callbacks
-            )
-            logging.info(f"Finished minecraft_launcher_lib.install.install_minecraft_version for {mc_version} on attempt {attempt}.")
-            update_status(f"Minecraft {mc_version} ready.", progress=30)
-            return True # Success, exit the loop and function
-        except Exception as e:
-            last_exception = e
-            logging.warning(f"Attempt {attempt} failed for installing {mc_version}: {e}")
-            # Don't immediately update status as error, wait until all retries fail
-
-    # If loop finishes without returning True, all attempts failed
-    logging.error(f"All {max_retries} attempts to install Minecraft {mc_version} failed.")
-    logging.exception(f"Last error during install attempt for {mc_version}: {last_exception}")
-    error_msg = f"Failed to install Minecraft {mc_version} after {max_retries} attempts. Last error: {last_exception}"
-    update_status(error_msg, is_error=True)
-
-    # Check if it exists anyway, maybe a previous partial install is usable?
-    logging.info(f"Checking if Minecraft {mc_version} exists despite installation failure...")
-    try:
-        installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(MINECRAFT_DIR))
-        if any(v['id'] == mc_version for v in installed_versions):
-            logging.warning(f"Installation failed, but found existing Minecraft {mc_version}. Attempting to continue.")
-            update_status(f"Using existing Minecraft {mc_version}.", progress=30)
-            return True # Allow continuing if it exists
-    except Exception as check_e:
-        logging.error(f"Could not even check for existing versions after install error: {check_e}")
-
-    return False # Definite failure
-
-
-def _install_forge(mc_version, loader_version):
-    """Installs Forge using the official installer with enhanced checks and logging."""
-    version_id = f"{mc_version}-forge-{loader_version}" # Expected ID format
-    update_status(f"Checking/Installing Forge {loader_version}...", progress=35)
-    installer_filename = f"forge-{mc_version}-{loader_version}-installer.jar"
-    installer_path = MINECRAFT_DIR / installer_filename # Store installer inside .minecraft temporarily
-    installer_url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_version}-{loader_version}/{installer_filename}"
-
-    # --- Pre-flight Checks ---
-    # 1. Check Java Installation
-    java_path = shutil.which('java')
-    if not java_path:
-        logging.error("Forge install check failed: 'java' command not found. Is Java installed and in PATH?")
-        update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", is_error=True)
-        return None
-    logging.info(f"Java executable found at: {java_path}")
-
-    # 2. Check Forge Installer URL Availability (HEAD request)
-    update_status("Checking Forge installer availability...", progress=37)
-    logging.info(f"Checking Forge installer URL (HEAD): {installer_url}")
-    try:
-        response = requests.head(installer_url, timeout=15)
-        response.raise_for_status() # Check for 4xx/5xx errors
-        logging.info(f"Forge installer URL check successful (Status: {response.status_code}).")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Forge installer URL check failed: {e}")
-        if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
-            update_status(f"Error: Forge installer for {mc_version}-{loader_version} not found at expected URL.", is_error=True)
+                    self.local_config = defaults # Reset to defaults
+            except json.JSONDecodeError as e:
+                logging.error(f"Error decoding local config file {LOCAL_CONFIG_FILE}: {e}. Using defaults.")
+                self._update_status(f"Error reading local config: {e}", is_error=True)
+                self.local_config = defaults # Reset to defaults
+            except Exception as e:
+                logging.exception(f"Unexpected error loading local config: {e}")
+                self._update_status(f"Error loading config: {e}", is_error=True)
+                self.local_config = defaults # Reset to defaults
         else:
-            update_status(f"Error checking Forge installer URL: {e}", is_error=True)
-        return None
+            logging.info("Local config file not found. Using defaults.")
+            self.local_config = defaults # Use defaults if file doesn't exist
 
-    # --- Installation Process ---
-    download_success = False
-    download_attempts = 3
-    last_download_exception = None
+        # Ensure essential keys have default values if somehow missing after load
+        for key, default_value in defaults.items():
+            if key not in self.local_config:
+                 logging.warning(f"Key '{key}' missing from loaded config, adding default: {default_value}")
+                 self.local_config[key] = default_value
 
-    for attempt in range(1, download_attempts + 1):
-        if attempt > 1:
-            logging.warning(f"Retrying Forge installer download (Attempt {attempt}/{download_attempts})...")
-            update_status(f"Retrying Forge download (Attempt {attempt})...", progress=40)
-            time.sleep(5) # Wait 5 seconds before retrying download
+        return self.local_config # Return the full dictionary
+
+    def save_local_config(self, nickname: str, gist_url: Optional[str] = None, max_ram: Optional[str] = None) -> bool:
+        """Saves current settings (nickname, gist_url, max_ram, installed_version) to local file."""
+        if not nickname: # Nickname is still mandatory for launch
+            logging.warning("Attempted to save empty nickname. Skipping save.")
+            # Don't update status here, let the caller handle UI feedback
+            return False
+
+        # Update the internal config dictionary
+        self.local_config["nickname"] = nickname
+        if gist_url is not None:
+             self.local_config["gist_url"] = gist_url
+        if max_ram is not None:
+             self.local_config["max_ram"] = max_ram
+        # installed_launcher_version is updated by _update_modpack
+
+        logging.info(f"Attempting to save local config: {self.local_config}")
+        try:
+            # Ensure the directory exists before writing
+            LOCAL_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOCAL_CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.local_config, f, indent=4)
+            logging.info("Local config saved successfully.")
+            return True
+        except Exception as e:
+            logging.exception(f"Error saving local config to {LOCAL_CONFIG_FILE}: {e}")
+            self._update_status(f"Error saving config: {e}", is_error=True)
+            return False
+
+    def fetch_launcher_config(self) -> bool:
+        """Fetches the latest config from the Gist URL specified in local config."""
+        self._update_status("Fetching remote configuration...", progress=5)
+        gist_url = self.local_config.get("gist_url", CONFIG_URL) # Use loaded URL, fallback to constant
+        if not gist_url:
+             logging.error("Gist URL is empty in local config. Cannot fetch remote config.")
+             self._update_status("Error: Gist URL is not configured.", is_error=True)
+             return False
 
         try:
-            # 3. Download Installer
-            update_status(f"Downloading Forge installer (Attempt {attempt})...", progress=40)
-            logging.info(f"Attempt {attempt}: Downloading Forge installer from {installer_url} to {installer_path}")
-            response = requests.get(installer_url, stream=True, timeout=120) # Longer timeout for download
+            timestamp = int(time.time())
+            # Ensure URL has a scheme
+            if not gist_url.startswith(('http://', 'https://')):
+                 gist_url = 'https://' + gist_url # Assume https if missing
+                 logging.warning(f"Prepended 'https://' to Gist URL: {gist_url}")
+
+            url_with_timestamp = f"{gist_url}?t={timestamp}" # Add timestamp to try bypassing cache
+            logging.info(f"Fetching config from: {url_with_timestamp}")
+            headers = {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
+            response = requests.get(url_with_timestamp, headers=headers, timeout=20)
             response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            bytes_downloaded = 0
-            with open(installer_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    # Check for chunk to avoid issues with empty chunks on connection errors
-                    if chunk:
-                        f.write(chunk)
-                        bytes_downloaded += len(chunk)
-                        if total_size > 0:
-                            dl_progress = (bytes_downloaded / total_size) * 10 # Scale download to 10% of this step
-                            update_status(f"Downloading Forge installer... {bytes_downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB", progress=40 + dl_progress)
-                    else:
-                        # If we receive an empty chunk, it might indicate a problem, break inner loop
-                        logging.warning("Received empty chunk during download, might indicate connection issue.")
-                        # We might need more robust handling here, but let's see if requests raises an error itself.
-                        pass # Continue for now, rely on requests exceptions
 
-            # Check if the full file was downloaded (if size is known)
-            if total_size > 0 and bytes_downloaded < total_size:
-                raise requests.exceptions.RequestException(f"Incomplete download: Expected {total_size} bytes, got {bytes_downloaded}")
-
-            logging.info(f"Forge installer downloaded successfully on attempt {attempt} ({bytes_downloaded} bytes).")
-            update_status("Forge installer downloaded.", progress=50)
-            download_success = True
-            break # Exit retry loop on success
-
+            self.launcher_config = response.json()
+            logging.info(f"Fetched remote config: {self.launcher_config}")
+            self._update_status("Remote configuration fetched.", progress=10)
+            return True
+        except requests.exceptions.Timeout:
+            logging.error("Timeout occurred while fetching remote config.")
+            self._update_status("Error: Timeout fetching remote configuration.", is_error=True)
+            self.launcher_config = {}
+            return False
         except requests.exceptions.RequestException as e:
-            last_download_exception = e
-            logging.error(f"Attempt {attempt} failed to download Forge installer: {e}")
-            # Clean up potentially incomplete download
+            logging.error(f"Error fetching remote config: {e}")
+            self._update_status(f"Error fetching remote config: {e}", is_error=True)
+            self.launcher_config = {}
+            return False
+        except json.JSONDecodeError as e:
+            logging.error(f"Error decoding remote config JSON: {e}")
+            self._update_status("Error: Invalid format in remote configuration file.", is_error=True)
+            self.launcher_config = {}
+            return False
+        except Exception as e:
+            logging.exception("An unexpected error occurred during config fetch.")
+            self._update_status(f"An unexpected error occurred: {e}", is_error=True)
+            self.launcher_config = {}
+            return False
+
+    # --- Installation/Update/Launch Steps ---
+    def _ensure_directories(self) -> bool:
+        """Ensures Minecraft and Mods directories exist."""
+        try:
+            self._update_status("Checking Minecraft directory...", progress=12) # Keep progress low
+            self.minecraft_dir.mkdir(parents=True, exist_ok=True)
+            self.mods_dir.mkdir(parents=True, exist_ok=True) # Ensure default mods dir exists too
+            logging.info(f"Ensured Minecraft directory exists: {self.minecraft_dir}")
+            logging.info(f"Ensured Mods directory exists: {self.mods_dir}")
+            return True
+        except OSError as e:
+            logging.exception(f"Error creating directories: {e}")
+            self._update_status(f"Error creating directories: {e}", is_error=True)
+            return False
+
+    def _install_minecraft_version(self, mc_version: str, progress_start: float, progress_end: float, max_retries: int = 3, retry_delay: int = 5) -> bool:
+        """
+        Installs the specified vanilla Minecraft version with retries and detailed progress.
+
+        Args:
+            mc_version: The Minecraft version string (e.g., "1.16.5").
+            progress_start: The starting percentage for this task on the main progress bar.
+            progress_end: The ending percentage for this task on the main progress bar.
+            max_retries: Maximum number of installation attempts.
+            retry_delay: Seconds to wait between retries.
+
+        Returns:
+            True if installation succeeded or version already exists, False otherwise.
+        """
+        task_name = f"Minecraft {mc_version}"
+        base_status = f"Installing {task_name}"
+        logging.info(f"Starting task: {base_status}")
+        self._set_task_progress_range(progress_start, progress_end, base_status) # Setup progress mapping
+
+        last_exception = None
+        for attempt in range(1, max_retries + 1):
+            logging.info(f"Attempt {attempt}/{max_retries} to install {task_name}...")
+            if attempt > 1:
+                # Update status for retry, keeping progress at the start of the range
+                self._update_status(f"Retrying {base_status} (Attempt {attempt}/{max_retries})...", progress=progress_start)
+                time.sleep(retry_delay)
+            else:
+                 # Initial status update for the first attempt
+                 self._update_status(f"{base_status} (Attempt 1/{max_retries})...", progress=progress_start)
+
+
+            try:
+                # --- Call library install directly in this thread ---
+                logging.info(f"Calling minecraft_launcher_lib.install.install_minecraft_version for {mc_version} (Attempt {attempt})")
+                minecraft_launcher_lib.install.install_minecraft_version(
+                    mc_version,
+                    str(self.minecraft_dir),
+                    callback=self.lib_callbacks
+                )
+                logging.info(f"Finished install call for {task_name} on attempt {attempt}.")
+                # Final status update for success, setting progress to the end of the range
+                self._update_status(f"{task_name} installation complete.", progress=progress_end)
+                logging.info(f"Task finished successfully: Install {task_name}")
+                return True # Success, exit the retry loop
+
+            except Exception as e: # Catch exceptions from the library call
+                 last_exception = e
+                 logging.warning(f"Attempt {attempt} failed for installing {task_name}: {e}")
+                 # Update status with error, keeping progress at the start
+                 self._update_status(f"Attempt {attempt} failed for {base_status}: {e}", progress=progress_start, is_error=True)
+                 # Fall through to retry or final error reporting
+
+        # --- All attempts failed ---
+        logging.error(f"All {max_retries} attempts to install {task_name} failed.")
+        error_msg = f"Failed to install {task_name}"
+        if last_exception:
+            logging.exception(f"Last error during install attempt for {task_name}: {last_exception}")
+            # Try to provide a slightly more specific error message
+            if "HTTPSConnectionPool" in str(last_exception):
+                 error_msg += ": Network error (check connection?)"
+            elif "checksum" in str(last_exception).lower():
+                 error_msg += ": File download error (checksum mismatch)."
+            else:
+                 error_msg += f": {last_exception}"
+        # Final error status update, keeping progress at the start of the range
+        self._update_status(error_msg, progress=progress_start, is_error=True)
+
+        # Check if it exists anyway (maybe installed previously or partially)
+        logging.info(f"Checking if {task_name} exists despite installation errors...")
+        try:
+            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(self.minecraft_dir))
+            if any(v['id'] == mc_version for v in installed_versions):
+                logging.warning(f"Installation failed, but found existing {task_name}. Attempting to continue.")
+                self._update_status(f"Using existing {task_name}.", progress=progress_end) # Set progress to end if using existing
+                return True # Allow continuing
+        except Exception as check_e:
+            logging.error(f"Could not check for existing versions after install errors: {check_e}")
+
+        logging.error(f"Task failed: Install {task_name}")
+        return False # Definite failure
+
+    def _install_forge(self, mc_version: str, loader_version: str, progress_start: float, progress_end: float) -> Optional[str]:
+        """
+        Installs Forge using the official installer with progress updates.
+
+        Args:
+            mc_version: Minecraft version.
+            loader_version: Forge version.
+            progress_start: Starting percentage for this task.
+            progress_end: Ending percentage for this task.
+
+        Returns:
+            The Forge version ID string if successful, None otherwise.
+        """
+        version_id = f"{mc_version}-forge-{loader_version}"
+        task_name = f"Forge {loader_version}"
+        base_status = f"Installing {task_name}"
+        logging.info(f"Starting task: {base_status}")
+        self._update_status(f"{base_status}...", progress=progress_start) # Initial status
+
+        installer_filename = f"forge-{mc_version}-{loader_version}-installer.jar"
+        installer_path = self.minecraft_dir / installer_filename
+        installer_url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_version}-{loader_version}/{installer_filename}"
+
+        # Define progress sub-ranges within the allocated range
+        check_start, check_end = progress_start, progress_start + (progress_end - progress_start) * 0.05 # 5% for check
+        dl_start, dl_end = check_end, check_end + (progress_end - check_end) * 0.6 # 60% of remaining for download
+        install_start, install_end = dl_end, dl_end + (progress_end - dl_end) * 0.8 # 80% of remaining for install run
+        verify_start, verify_end = install_end, progress_end # Rest for verify
+
+        # --- Pre-flight Checks ---
+        java_path = shutil.which('java')
+        if not java_path:
+            logging.error("Forge install check failed: 'java' command not found.")
+            self._update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", progress=progress_start, is_error=True)
+            return None
+        logging.info(f"Java executable found at: {java_path}")
+
+        self._update_status(f"Checking {task_name} installer availability...", progress=check_start)
+        logging.info(f"Checking Forge installer URL (HEAD): {installer_url}")
+        try:
+            response = requests.head(installer_url, timeout=15) # Short timeout for HEAD
+            response.raise_for_status() # Check for 4xx/5xx errors
+            logging.info(f"Forge installer URL check successful (Status: {response.status_code}).")
+            self._update_status(f"Checking {task_name} installer availability... OK", progress=check_end)
+        except requests.exceptions.Timeout:
+            logging.error(f"Forge installer URL check timed out: {installer_url}")
+            self._update_status(f"Error checking {task_name} availability (Timeout)", progress=check_start, is_error=True)
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Forge installer URL check failed: {e}")
+            error_msg = f"Error checking {task_name} availability"
+            if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+                 if e.response.status_code == 404:
+                     error_msg = f"Error: {task_name} installer not found for {mc_version}"
+                 else:
+                     error_msg += f" (HTTP {e.response.status_code})"
+            else:
+                 error_msg += f": {e}"
+            self._update_status(error_msg, progress=check_start, is_error=True)
+            return None
+
+        # --- Installation Process ---
+        download_success = False
+        download_attempts = 3
+        last_download_exception = None
+
+        for attempt in range(1, download_attempts + 1):
+            if attempt > 1:
+                logging.warning(f"Retrying {task_name} installer download (Attempt {attempt}/{download_attempts})...")
+                self._update_status(f"Retrying {task_name} download (Attempt {attempt})...", progress=dl_start)
+                time.sleep(5)
+
+            try:
+                self._update_status(f"Downloading {task_name} installer (Attempt {attempt})...", progress=dl_start)
+                logging.info(f"Attempt {attempt}: Downloading {task_name} installer from {installer_url} to {installer_path}")
+                response = requests.get(installer_url, stream=True, timeout=300) # Longer timeout for download
+                response.raise_for_status()
+                total_size = int(response.headers.get('content-length', 0)) # Can be 0 if server doesn't provide it
+                bytes_downloaded = 0
+                last_progress_update_time = time.monotonic()
+                with open(installer_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk: # filter out keep-alive new chunks
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            # Update progress bar during download, mapping to dl_start -> dl_end range
+                            current_time = time.monotonic()
+                            if total_size > 0:
+                                dl_percent = bytes_downloaded / total_size
+                                current_gui_progress = dl_start + dl_percent * (dl_end - dl_start)
+                                # Throttle GUI updates slightly
+                                if current_time - last_progress_update_time > 0.1 or bytes_downloaded == total_size:
+                                    self._update_status(f"Downloading {task_name}... {bytes_downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB", progress=current_gui_progress)
+                                    last_progress_update_time = current_time
+                            elif current_time - last_progress_update_time > 0.5: # Update less often if no total size
+                                current_gui_progress = dl_start + (dl_end - dl_start) * 0.5 # Show indeterminate 50% within range
+                                self._update_status(f"Downloading {task_name}... {bytes_downloaded/1024/1024:.1f} MB", progress=current_gui_progress)
+                                last_progress_update_time = current_time
+                        # else: # Removed logging for empty chunks, too noisy
+                        #     pass
+
+                # Verify download size if total_size was provided
+                if total_size > 0 and bytes_downloaded < total_size:
+                    raise requests.exceptions.RequestException(f"Incomplete download: Expected {total_size} bytes, got {bytes_downloaded}")
+
+                logging.info(f"{task_name} installer downloaded successfully on attempt {attempt} ({bytes_downloaded} bytes).")
+                self._update_status(f"{task_name} installer downloaded.", progress=dl_end) # Mark download complete
+                download_success = True
+                break # Exit download retry loop
+
+            except requests.exceptions.RequestException as e:
+                last_download_exception = e
+                logging.error(f"Attempt {attempt} failed to download {task_name} installer: {e}")
+                if installer_path.exists():
+                    try: installer_path.unlink() # Clean up partial download
+                    except OSError: pass
+                # Keep progress at dl_start on error
+                self._update_status(f"Error downloading {task_name} (Attempt {attempt}): {e}", progress=dl_start, is_error=True)
+
+        if not download_success:
+            logging.error(f"Failed to download {task_name} installer after {download_attempts} attempts.")
+            self._update_status(f"Error downloading {task_name} installer: {last_download_exception}", progress=dl_start, is_error=True)
+            return None
+
+        # --- Run Installer ---
+        try:
+            self._update_status(f"Running {task_name} installer...", progress=install_start) # Indicate installer start
+            command = [java_path, "-jar", str(installer_path), "--installClient"]
+            logging.info(f"Running Forge installer command: {' '.join(command)}")
+            # Use Popen for potentially long-running process, capture output later if needed
+            process = subprocess.Popen(
+                command, cwd=str(self.minecraft_dir),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace'
+            )
+
+            # Optional: Could add a timeout here if the installer hangs indefinitely
+            stdout, stderr = process.communicate(timeout=300) # 5 minute timeout for installer run
+
+            if stdout: logging.info(f"Forge Installer STDOUT:\n{stdout.strip()}")
+            if stderr:
+                log_level = logging.ERROR if process.returncode != 0 else logging.WARNING
+                logging.log(log_level, f"Forge Installer STDERR:\n{stderr.strip()}")
+
+            if process.returncode != 0:
+                logging.error(f"Forge installer failed with return code {process.returncode}.")
+                error_message = f"Forge installer failed (code {process.returncode})"
+                # Try to parse common errors from stderr for better user feedback
+                if "java.net" in stderr: error_message += ": Network error during install."
+                elif "FileNotFoundException" in stderr: error_message += ": File not found during install."
+                elif "Could not find main class" in stderr: error_message += ": Corrupted download or Java issue."
+                elif "Target directory" in stderr and "invalid" in stderr: error_message += ": Invalid target directory?"
+                else: error_message += ". Check log."
+                self._update_status(error_message, progress=install_start, is_error=True)
+                return None
+
+            logging.info(f"Forge installer process completed successfully (RC: {process.returncode}).")
+            self._update_status(f"{task_name} installer finished.", progress=install_end) # Installer done
+
+            # --- Verify Installation ---
+            logging.info(f"Verifying {task_name} installation: {version_id}")
+            self._update_status(f"Verifying {task_name} installation...", progress=verify_start) # Verification step
+            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(self.minecraft_dir))
+            if any(v['id'] == version_id for v in installed_versions):
+                logging.info(f"{task_name} version {version_id} successfully verified.")
+                self._update_status(f"{task_name} installed successfully.", progress=verify_end) # Final success for Forge
+                logging.info(f"Task finished successfully: Install {task_name}")
+                return version_id # Success!
+            else:
+                logging.error(f"Forge installer ran, but version ID '{version_id}' not found.")
+                self._update_status(f"Warning: {task_name} install verification failed.", progress=verify_start, is_error=True)
+                return None
+
+        except subprocess.TimeoutExpired:
+            logging.error(f"Forge installer timed out after 300 seconds.")
+            self._update_status(f"Error: {task_name} installer timed out.", progress=install_start, is_error=True)
+            try:
+                 if process.poll() is None: # Check if process is still running
+                      process.kill() # Ensure the process is terminated if possible
+                      process.wait() # Wait for termination
+            except Exception as kill_e:
+                 logging.warning(f"Could not kill timed-out Forge process: {kill_e}")
+            return None
+        except FileNotFoundError: # If java_path becomes invalid between check and run
+            logging.error("Forge installer run failed: 'java' command not found.")
+            self._update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", progress=install_start, is_error=True)
+            return None
+        except Exception as e:
+            logging.exception(f"An unexpected error occurred during {task_name} installation: {e}")
+            self._update_status(f"Error installing {task_name}: {e}", progress=install_start, is_error=True)
+            return None
+        finally:
+            # Ensure installer JAR is cleaned up
             if installer_path.exists():
                 try:
                     installer_path.unlink()
-                except OSError: pass # Ignore cleanup error
-            # Continue to next attempt
+                    logging.info(f"{task_name} installer file '{installer_path.name}' cleaned up.")
+                except OSError as e:
+                    logging.warning(f"Could not delete {task_name} installer {installer_path}: {e}")
 
-    if not download_success:
-        logging.error(f"Failed to download Forge installer after {download_attempts} attempts.")
-        update_status(f"Error downloading Forge installer after multiple attempts: {last_download_exception}", is_error=True)
-        return None # Exit if download failed
+    def _install_fabric(self, mc_version: str, loader_version: str, progress_start: float, progress_end: float, max_retries: int = 3, retry_delay: int = 5) -> Optional[str]:
+        """
+        Installs Fabric using minecraft-launcher-lib with retries and progress.
 
-    # --- Continue only if download was successful ---
-    try:
-        # 4. Run Installer
-        update_status("Running Forge installer...", progress=51)
-        command = [java_path, "-jar", str(installer_path), "--installClient"]
-        logging.info(f"Running Forge installer command: {' '.join(command)}")
-        process = subprocess.run(
-            command,
-            cwd=str(MINECRAFT_DIR), # Run from Minecraft dir context
-            check=False, # Don't raise exception immediately
-            capture_output=True, # Capture stdout/stderr
-            text=True,
-            encoding='utf-8', # Be explicit about encoding
-            errors='replace' # Handle potential encoding errors in output
-        )
+        Args:
+            mc_version: Minecraft version.
+            loader_version: Fabric loader version.
+            progress_start: Starting percentage for this task.
+            progress_end: Ending percentage for this task.
+            max_retries: Max installation attempts.
+            retry_delay: Delay between retries.
 
-        # Log stdout/stderr regardless of success, but log errors more prominently
-        if process.stdout:
-            logging.info(f"Forge Installer STDOUT:\n{process.stdout.strip()}")
-        if process.stderr:
-            # Log stderr as warning even on success, as installers sometimes print info there
-            log_level = logging.ERROR if process.returncode != 0 else logging.WARNING
-            logging.log(log_level, f"Forge Installer STDERR:\n{process.stderr.strip()}")
+        Returns:
+            Fabric version ID string if successful, None otherwise.
+        """
+        task_name = f"Fabric {loader_version}"
+        base_status = f"Installing {task_name}"
+        logging.info(f"Starting task: {base_status}")
+        self._set_task_progress_range(progress_start, progress_end, base_status) # Setup progress mapping
+        last_exception = None
 
-        # Check return code
-        if process.returncode != 0:
-            logging.error(f"Forge installer failed with return code {process.returncode}.")
-            error_message = f"Forge installer failed (code {process.returncode}). Check launcher.log for details."
-            # Try to parse common errors from stderr
-            if "java.net" in process.stderr:
-                error_message = "Forge installer failed: Network error during installation."
-            elif "FileNotFoundException" in process.stderr:
-                error_message = "Forge installer failed: Could not find necessary files."
-            elif "Could not find main class" in process.stderr:
-                error_message = "Forge installer failed: Corrupted download or Java issue."
-            update_status(error_message, is_error=True)
-            return None # Installation failed
-
-        logging.info(f"Forge installer process completed successfully (Return Code: {process.returncode}).")
-        update_status("Forge installer finished.", progress=58)
-
-        # 5. Verify Installation
-        logging.info(f"Verifying Forge installation by checking for version ID: {version_id}")
-        try:
-            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(MINECRAFT_DIR))
-            if any(v['id'] == version_id for v in installed_versions):
-                logging.info(f"Forge version {version_id} successfully verified in versions list.")
-                update_status(f"Forge {loader_version} installed successfully.", progress=60)
-                return version_id # Success!
+        for attempt in range(1, max_retries + 1):
+            logging.info(f"Attempt {attempt}/{max_retries} to install {task_name} for {mc_version}...")
+            if attempt > 1:
+                self._update_status(f"Retrying {base_status} (Attempt {attempt}/{max_retries})...", progress=progress_start)
+                time.sleep(retry_delay)
             else:
-                logging.error(f"Forge installer ran successfully, but version ID '{version_id}' was not found in versions list afterwards.")
-                update_status(f"Warning: Forge install seemed successful, but verification failed.", is_error=True)
-                return None # Verification failed
-        except Exception as check_e:
-            logging.exception(f"Error verifying Forge installation: {check_e}")
-            update_status(f"Warning: Error verifying Forge install: {check_e}", is_error=True)
-            return None # Verification failed
+                self._update_status(f"{base_status} (Attempt 1/{max_retries})...", progress=progress_start)
 
-    except requests.exceptions.RequestException as e:
-        logging.exception(f"Error downloading Forge installer: {e}")
-        update_status(f"Error downloading Forge installer: {e}", is_error=True)
-        return None
-    except Exception as e:
-        logging.exception(f"An unexpected error occurred during Forge installation: {e}")
-        update_status(f"Error installing Forge: {e}", is_error=True)
-        return None
-    finally:
-        # 6. Clean up installer file
-        if installer_path.exists():
             try:
-                installer_path.unlink()
-                logging.info(f"Forge installer file '{installer_path.name}' cleaned up.")
-            except OSError as e:
-                logging.warning(f"Could not delete Forge installer {installer_path}: {e}")
+                # Reset lib progress state (handled by _set_task_progress_range)
 
+                logging.info(f"Calling minecraft_launcher_lib.fabric.install_fabric for {mc_version}, {loader_version} (Attempt {attempt})")
+                minecraft_launcher_lib.fabric.install_fabric(
+                    mc_version, loader_version, str(self.minecraft_dir), callback=self.lib_callbacks
+                )
+                logging.info(f"Call to install_fabric for {task_name} completed on attempt {attempt}.")
+                self._update_status(f"{task_name} installation complete.", progress=progress_end) # Final success status
 
-def _install_fabric(mc_version, loader_version, max_retries=3, retry_delay=10):
-    """Installs Fabric using minecraft-launcher-lib with retries."""
-    update_status(f"Checking/Installing Fabric {loader_version}...", progress=35)
-    last_exception = None
+                # Verify and find version ID
+                installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(self.minecraft_dir))
+                for v in installed_versions:
+                    # Make matching slightly more robust
+                    if v['type'] == 'release' and mc_version in v['id'] and 'fabric-loader' in v['id'] and loader_version in v['id']:
+                        logging.info(f"Detected Fabric version ID: {v['id']}")
+                        logging.info(f"Task finished successfully: Install {task_name}")
+                        return v['id'] # Return detected ID
 
-    for attempt in range(1, max_retries + 1):
-        logging.info(f"Attempt {attempt}/{max_retries} to install Fabric {loader_version} for {mc_version}...")
-        if attempt > 1:
-            update_status(f"Retrying Fabric {loader_version} install (Attempt {attempt}/{max_retries})...", progress=35 + attempt)
-            time.sleep(retry_delay)
-
-        try:
-            logging.info(f"Calling minecraft_launcher_lib.fabric.install_fabric for {mc_version}, {loader_version} (Attempt {attempt})")
-            minecraft_launcher_lib.fabric.install_fabric(
-                mc_version,
-                loader_version,
-                str(MINECRAFT_DIR),
-                callback=LIB_CALLBACKS
-            )
-            # Log success immediately after the call returns
-            logging.info(f"Call to install_fabric for {mc_version}, {loader_version} completed successfully on attempt {attempt}.")
-            update_status(f"Fabric {loader_version} installed.", progress=60)
-
-            # Try to find the exact version ID created by the installer
-            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(MINECRAFT_DIR))
-            for v in installed_versions:
-                # Heuristic: Match type, mc_version, 'fabric', and loader_version in the ID
-                if v['type'] == 'release' and mc_version in v['id'] and 'fabric' in v['id'] and loader_version in v['id']:
-                    logging.info(f"Detected Fabric version ID: {v['id']}")
-                    return v['id'] # Return the detected ID
-
-            # Fallback if exact ID not found (might be less reliable)
-            fallback_id = f"fabric-loader-{loader_version}-{mc_version}"
-            logging.warning(f"Could not auto-detect exact Fabric version ID. Using fallback: {fallback_id}")
-            return fallback_id # Return the fallback ID
-
-        except Exception as e:
-            last_exception = e
-            logging.warning(f"Attempt {attempt} failed for installing Fabric {loader_version}: {e}")
-            # Don't update status as error immediately, wait for all retries
-
-    # If loop finishes without returning a version ID, all attempts failed
-    logging.error(f"All {max_retries} attempts to install Fabric {loader_version} failed.")
-    logging.exception(f"Last error during Fabric install attempt: {last_exception}")
-    update_status(f"Failed to install Fabric {loader_version} after {max_retries} attempts: {last_exception}", is_error=True)
-    return None
-
-
-def _update_modpack(mods_url, gist_launcher_version):
-    """Handles clearing old mods and downloading/extracting the new modpack."""
-    installed_launcher_version = local_config.get("installed_launcher_version", 0)
-    logging.info(f"Checking modpack update: Gist Version={gist_launcher_version}, Local Version={installed_launcher_version}")
-    needs_mod_update = gist_launcher_version > installed_launcher_version
-    modpack_configured = bool(mods_url)
-
-    if not modpack_configured:
-        update_status("No modpack configured.", progress=95)
-        # Optional: Clear existing mods if none are configured
-        if MODS_DIR.exists() and any(MODS_DIR.iterdir()): # Check if not empty
-            update_status("No modpack configured. Clearing local mods folder...", progress=70)
-            if _clear_mods_folder():
-                update_status("Local mods folder cleared.", progress=95)
-            else:
-                # Error handled in _clear_mods_folder
-                return False # Stop if clearing failed
-        return True # Success (no update needed/done)
-
-    if not needs_mod_update:
-        logging.info("Modpack is up-to-date. No update needed.")
-        update_status("Modpack is up-to-date.", progress=95)
-        return True # Success (no update needed)
-
-    # --- Mod Update Required ---
-    logging.info(f"Newer modpack version ({gist_launcher_version}) found. Starting update process.")
-    update_status(f"New version ({gist_launcher_version}) found. Updating modpack...", progress=65)
-
-    # 1. Clear existing mods
-    logging.info("Attempting to clear mods folder...")
-    clear_success = _clear_mods_folder()
-    logging.info(f"Mods folder clear attempt result: {clear_success}")
-    if not clear_success:
-        return False # Stop if clearing failed
-
-    # 2. Download new mods
-    update_status(f"Downloading modpack...", progress=75)
-    download_path = Path("mods_temp.zip") # Temporary file name
-    try:
-        # Determine download method based on URL
-        is_direct_zip = mods_url.lower().startswith(('http://', 'https://')) and mods_url.lower().endswith('.zip')
-
-        if is_direct_zip:
-            logging.info(f"Downloading modpack from direct URL: {mods_url}")
-            response = requests.get(mods_url, stream=True, timeout=180) # Longer timeout for potentially large files
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            bytes_downloaded = 0
-            with open(download_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    bytes_downloaded += len(chunk)
-                    if total_size > 0:
-                        # Scale download progress (75% to 85% range)
-                        dl_progress = (bytes_downloaded / total_size) * 10
-                        update_status(f"Downloading modpack... {bytes_downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB", progress=75 + dl_progress)
-            logging.info(f"Modpack downloaded successfully ({bytes_downloaded} bytes).")
-            update_status("Modpack downloaded. Extracting...", progress=85)
-        else:
-            # Assume Google Drive URL, use gdown
-            logging.info(f"Downloading modpack from Google Drive URL: {mods_url}")
-            # Note: gdown doesn't easily provide progress for the main progress bar
-            # We'll just show a generic message during gdown download
-            update_status("Downloading modpack (Google Drive)...", progress=78) # Indicate gdown is working
-            gdown.download(mods_url, str(download_path), quiet=False, fuzzy=True)
-            logging.info(f"Modpack downloaded via gdown to {download_path}")
-            update_status("Modpack downloaded. Extracting...", progress=85)
-
-        # 3. Extract mods (common step)
-        logging.info(f"Attempting to extract {download_path} to {MODS_DIR}")
-        try:
-            with zipfile.ZipFile(download_path, 'r') as zip_ref:
-                # Log contents before extraction
-                zip_contents = zip_ref.namelist()
-                logging.info(f"Zip file contents: {zip_contents}")
-                zip_ref.extractall(MODS_DIR)
-            logging.info(f"Successfully extracted zip to {MODS_DIR}")
-            # Log contents of mods dir after extraction
-            try:
-                mods_dir_contents = os.listdir(MODS_DIR)
-                logging.info(f"Mods directory contents after extraction: {mods_dir_contents}")
-            except Exception as list_e:
-                logging.warning(f"Could not list mods directory after extraction: {list_e}")
-
-            # --- Check for nested directory structure ---
-            try:
-                mods_dir_items = list(MODS_DIR.iterdir())
-                if len(mods_dir_items) == 1 and mods_dir_items[0].is_dir():
-                    nested_dir = mods_dir_items[0]
-                    logging.warning(f"Detected single nested directory after extraction: {nested_dir.name}. Moving contents up.")
-                    update_status("Adjusting nested mod directory structure...", progress=93)
-                    moved_count = 0
-                    for item in nested_dir.iterdir():
-                        try:
-                            target_path = MODS_DIR / item.name
-                            shutil.move(str(item), str(target_path))
-                            moved_count += 1
-                        except Exception as move_e:
-                            logging.error(f"Failed to move item {item.name} from nested directory: {move_e}")
-                            # Decide if this is critical - maybe stop? For now, just log.
-                    logging.info(f"Moved {moved_count} items from {nested_dir.name} to {MODS_DIR}.")
-                    # Clean up the now potentially empty nested directory
-                    try:
-                        nested_dir.rmdir() # Fails if not empty, which is good.
-                        logging.info(f"Removed empty nested directory: {nested_dir.name}")
-                    except OSError as rmdir_e:
-                        logging.warning(f"Could not remove nested directory {nested_dir.name} (maybe not empty?): {rmdir_e}")
+                # If exact match not found, construct a likely ID and warn
+                fallback_id = f"fabric-loader-{loader_version}-{mc_version}"
+                logging.warning(f"Could not auto-detect exact Fabric version ID after install. Using fallback: {fallback_id}")
+                # Check if the fallback ID actually exists
+                if any(v['id'] == fallback_id for v in installed_versions):
+                    logging.info(f"Fallback ID {fallback_id} confirmed in installed versions.")
+                    logging.info(f"Task finished successfully (using fallback ID): Install {task_name}")
+                    return fallback_id
                 else:
-                    logging.info("Mods directory structure seems correct (not a single nested directory).")
+                    # If even the fallback isn't found, something is wrong
+                    logging.error(f"Fabric install seemed to succeed, but neither auto-detected nor fallback ID ({fallback_id}) found.")
+                    last_exception = RuntimeError("Fabric install verification failed.") # Create an exception for reporting
+                    # Fall through to error handling below
 
-            except Exception as structure_check_e:
-                logging.exception(f"Error checking/adjusting mod directory structure: {structure_check_e}")
-                # Don't fail the whole process, but log it.
+            except Exception as e:
+                last_exception = e
+                logging.warning(f"Attempt {attempt} failed for installing {task_name}: {e}")
+                self._update_status(f"Attempt {attempt} failed for {base_status}: {e}", progress=progress_start, is_error=True)
 
-            update_status("Mods extracted.", progress=95)
+        # --- All attempts failed ---
+        logging.error(f"All {max_retries} attempts to install {task_name} failed.")
+        error_msg = f"Failed to install {task_name}"
+        if last_exception:
+            logging.exception(f"Last error during {task_name} install attempt: {last_exception}")
+            error_msg += f": {last_exception}"
+        self._update_status(error_msg, progress=progress_start, is_error=True)
+        logging.error(f"Task failed: Install {task_name}")
+        return None
 
-        except zipfile.BadZipFile:
-            logging.error(f"Error extracting modpack: Downloaded file '{download_path}' is not a valid zip file.")
-            update_status("Error: Downloaded modpack file is corrupted or not a zip.", is_error=True)
-            return False # Extraction failed
-        except Exception as extract_e:
-            logging.exception(f"An unexpected error occurred during modpack extraction: {extract_e}")
-            update_status(f"Error extracting mods: {extract_e}", is_error=True)
-            return False # Extraction failed
+    def _update_modpack(self, mods_url: Optional[str], gist_launcher_version: int, progress_start: float, progress_end: float) -> bool:
+        """
+        Handles clearing old mods and downloading/extracting the new modpack with progress.
 
+        Args:
+            mods_url: URL of the modpack zip (direct or GDrive).
+            gist_launcher_version: Version number from the remote config.
+            progress_start: Starting percentage for this task.
+            progress_end: Ending percentage for this task.
 
-        # 4. Update local config version *after* successful extraction
-        local_config["installed_launcher_version"] = gist_launcher_version
-        if not save_local_config(): # Save the updated version number
-            # Error saving config, but mods are updated. Log warning.
-            logging.warning("Modpack updated, but failed to save new version number to local config.")
-            update_status("Warning: Modpack updated, but failed to save config.", is_error=True)
-            # Continue anyway, as the mods are present
+        Returns:
+            True if successful or no update needed, False on error.
+        """
+        task_name = "Modpack Update"
+        base_status = "Updating Modpack"
+        logging.info(f"Starting task: {task_name}")
+        installed_launcher_version = self.local_config.get("installed_launcher_version", 0)
+        logging.info(f"Checking modpack update: Gist Version={gist_launcher_version}, Local Version={installed_launcher_version}")
+        needs_mod_update = gist_launcher_version > installed_launcher_version
+        modpack_configured = bool(mods_url)
 
-        update_status("Modpack updated successfully.")
-        return True
+        # Define progress sub-ranges
+        clear_start, clear_end = progress_start, progress_start + (progress_end - progress_start) * 0.1 # 10% for clear
+        dl_start, dl_end = clear_end, clear_end + (progress_end - clear_end) * 0.6 # 60% of remaining for download
+        extract_start, extract_end = dl_end, dl_end + (progress_end - dl_end) * 0.8 # 80% of remaining for extract
+        structure_start, structure_end = extract_end, progress_end # Rest for structure check
 
-    except requests.exceptions.RequestException as e:
-        logging.exception(f"Error downloading modpack via requests: {e}")
-        update_status(f"Error downloading modpack: {e}", is_error=True)
-        return False
-    except gdown.exceptions.GDownException as e:
-        logging.error(f"gdown error downloading modpack: {e}")
-        update_status(f"Error downloading modpack (check GDrive URL/permissions?): {e}", is_error=True)
-        return False
-    except zipfile.BadZipFile:
-        logging.error(f"Error extracting modpack: Downloaded file '{download_path}' is not a valid zip file.")
-        update_status("Error: Downloaded modpack file is corrupted or not a zip.", is_error=True)
-        return False
-    except Exception as e:
-        logging.exception(f"An unexpected error occurred during modpack update: {e}")
-        update_status(f"Error updating mods: {e}", is_error=True)
-        return False
-    finally:
-        # Clean up downloaded zip file
-        if download_path.exists():
-            try:
-                download_path.unlink()
-                logging.info("Temporary modpack zip file deleted.")
-            except OSError as e:
-                logging.warning(f"Could not delete temporary modpack file {download_path}: {e}")
+        if not modpack_configured:
+            self._update_status("No modpack configured.", progress=progress_end) # Jump to end
+            if self.mods_dir.exists() and any(self.mods_dir.iterdir()):
+                self._update_status("No modpack configured. Clearing local mods folder...", progress=clear_start)
+                if self._clear_mods_folder(clear_start, clear_end): # Pass progress range
+                    self._update_status("Local mods folder cleared.", progress=progress_end) # Jump to end after clear
+                else:
+                    logging.error(f"Task failed: {task_name} (clearing failed)")
+                    # Error status already set by _clear_mods_folder
+                    return False # Stop if clearing failed
+            logging.info(f"Task finished successfully: {task_name} (no update needed/done)")
+            return True
 
+        if not needs_mod_update:
+            logging.info("Modpack is up-to-date. No update needed.")
+            self._update_status("Modpack is up-to-date.", progress=progress_end) # Jump to end
+            logging.info(f"Task finished successfully: {task_name} (up-to-date)")
+            return True
 
-def _clear_mods_folder():
-    """Clears the contents of the mods folder."""
-    if not MODS_DIR.exists():
-        logging.info("Mods directory does not exist, nothing to clear.")
-        return True # Nothing to do
+        # --- Mod Update Required ---
+        logging.info(f"Newer modpack version ({gist_launcher_version}) found. Starting update process.")
+        self._update_status(f"New version ({gist_launcher_version}) found. Updating modpack...", progress=progress_start)
 
-    update_status("Deleting old mods...", progress=70)
-    logging.info(f"Clearing mods folder: {MODS_DIR}")
-    items_deleted = 0
-    items_failed = 0
-    for item in MODS_DIR.iterdir():
+        # 1. Clear existing mods
+        logging.info("Attempting to clear mods folder...")
+        if not self._clear_mods_folder(clear_start, clear_end): # Pass progress range
+            logging.error(f"Task failed: {task_name} (clearing failed)")
+            # Error status already set by _clear_mods_folder
+            return False
+
+        # 2. Download new mods
+        self._update_status(f"Downloading modpack...", progress=dl_start)
+        download_path = Path("mods_temp.zip")
         try:
-            if item.is_file() or item.is_symlink():
-                item.unlink()
-                items_deleted += 1
-            elif item.is_dir():
-                shutil.rmtree(item)
-                items_deleted += 1
-            logging.debug(f"Deleted: {item.name}")
+            is_direct_zip = mods_url.lower().startswith(('http://', 'https://')) and mods_url.lower().endswith('.zip')
+
+            if is_direct_zip:
+                logging.info(f"Downloading modpack from direct URL: {mods_url}")
+                response = requests.get(mods_url, stream=True, timeout=300) # Increased timeout
+                response.raise_for_status()
+                total_size = int(response.headers.get('content-length', 0))
+                bytes_downloaded = 0
+                last_progress_update_time = time.monotonic()
+                with open(download_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            current_time = time.monotonic()
+                            if total_size > 0:
+                                dl_percent = bytes_downloaded / total_size
+                                current_gui_progress = dl_start + dl_percent * (dl_end - dl_start)
+                                # Throttle GUI updates
+                                if current_time - last_progress_update_time > 0.1 or bytes_downloaded == total_size:
+                                    self._update_status(f"Downloading modpack... {bytes_downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB", progress=current_gui_progress)
+                                    last_progress_update_time = current_time
+                            elif current_time - last_progress_update_time > 0.5: # Update less often if no total size
+                                current_gui_progress = dl_start + (dl_end - dl_start) * 0.5 # Indeterminate
+                                self._update_status(f"Downloading modpack... {bytes_downloaded/1024/1024:.1f} MB", progress=current_gui_progress)
+                                last_progress_update_time = current_time
+
+                if total_size > 0 and bytes_downloaded < total_size:
+                     raise requests.exceptions.RequestException(f"Incomplete download: Expected {total_size} bytes, got {bytes_downloaded}")
+
+                logging.info(f"Modpack downloaded successfully ({bytes_downloaded} bytes).")
+                self._update_status("Modpack downloaded. Extracting...", progress=dl_end) # Mark download complete
+            else:
+                # gdown doesn't offer easy progress hooks
+                logging.info(f"Downloading modpack from Google Drive URL: {mods_url}")
+                self._update_status("Downloading modpack (Google Drive)...", progress=dl_start + (dl_end - dl_start) * 0.5) # Show indeterminate progress
+                gdown.download(mods_url, str(download_path), quiet=False, fuzzy=True) # Consider adding timeout if gdown supports it
+                logging.info(f"Modpack downloaded via gdown to {download_path}")
+                self._update_status("Modpack downloaded. Extracting...", progress=dl_end) # Mark download complete
+
+            # 3. Extract mods
+            logging.info(f"Attempting to extract {download_path} to {self.mods_dir}")
+            try:
+                with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                    zip_contents = zip_ref.namelist()
+                    logging.info(f"Zip file contents: {zip_contents}")
+                    # Show status before and after extraction
+                    self._update_status("Extracting modpack...", progress=extract_start) # Start extraction phase
+                    zip_ref.extractall(self.mods_dir)
+                logging.info(f"Successfully extracted zip to {self.mods_dir}")
+                self._update_status("Modpack extracted.", progress=extract_end) # Extraction done
+                mods_dir_contents = os.listdir(self.mods_dir)
+                logging.info(f"Mods directory contents after extraction: {mods_dir_contents}")
+
+                # Check for nested directory structure (quick step)
+                self._update_status("Checking modpack structure...", progress=structure_start)
+                self._adjust_nested_mod_directory()
+                self._update_status("Modpack structure checked.", progress=structure_end)
+
+            except zipfile.BadZipFile:
+                logging.error(f"Error extracting modpack: '{download_path}' is not a valid zip file.")
+                self._update_status("Error: Downloaded modpack file is corrupted or not a zip.", progress=extract_start, is_error=True)
+                return False
+            except Exception as extract_e:
+                logging.exception(f"An unexpected error occurred during modpack extraction: {extract_e}")
+                self._update_status(f"Error extracting mods: {extract_e}", progress=extract_start, is_error=True)
+                return False
+
+            # 4. Update local config version *after* successful extraction
+            self.local_config["installed_launcher_version"] = gist_launcher_version
+            # Save happens later in the main sequence
+
+            self._update_status("Modpack update process complete.", progress=progress_end) # Final step for modpack update phase
+            logging.info(f"Task finished successfully: {task_name}")
+            return True
+
+        except requests.exceptions.RequestException as e:
+            logging.exception(f"Error downloading modpack via requests: {e}")
+            self._update_status(f"Error downloading modpack: {e}", progress=dl_start, is_error=True)
+            return False
+        except gdown.exceptions.GDownException as e:
+            logging.error(f"gdown error downloading modpack: {e}")
+            self._update_status(f"Error downloading modpack (check GDrive URL/permissions?): {e}", progress=dl_start, is_error=True)
+            return False
         except Exception as e:
-            items_failed += 1
-            logging.error(f"Failed to delete {item}: {e}")
+            logging.exception(f"An unexpected error occurred during modpack update: {e}")
+            self._update_status(f"Error updating mods: {e}", progress=progress_start, is_error=True) # Use overall start progress
+            return False
+        finally:
+            if download_path.exists():
+                try:
+                    download_path.unlink()
+                    logging.info("Temporary modpack zip file deleted.")
+                except OSError as e:
+                    logging.warning(f"Could not delete temporary modpack file {download_path}: {e}")
 
-    if items_failed > 0:
-        logging.error(f"Failed to delete {items_failed} items in mods folder.")
-        update_status(f"Error: Could not delete all old mods (failed: {items_failed}). Check permissions.", is_error=True)
-        return False
-    else:
-        logging.info(f"Successfully deleted {items_deleted} items from mods folder.")
-        update_status("Old mods deleted.", progress=75)
-        return True
+    def _clear_mods_folder(self, progress_start: float, progress_end: float) -> bool:
+        """Clears the contents of the mods folder with progress indication."""
+        if not self.mods_dir.exists():
+            logging.info("Mods directory does not exist, nothing to clear.")
+            self._update_status("Mods directory clear (already empty).", progress=progress_end)
+            return True
+
+        self._update_status("Deleting old mods...", progress=progress_start)
+        logging.info(f"Clearing mods folder: {self.mods_dir}")
+        items_deleted = 0
+        items_failed = 0
+        try:
+            all_items = list(self.mods_dir.iterdir())
+            total_items = len(all_items)
+            for i, item in enumerate(all_items):
+                try:
+                    if item.is_file() or item.is_symlink():
+                        item.unlink()
+                        items_deleted += 1
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+                        items_deleted += 1
+                    logging.debug(f"Deleted: {item.name}")
+
+                    # Update progress during deletion
+                    if total_items > 0:
+                        clear_percent = (i + 1) / total_items
+                        current_gui_progress = progress_start + clear_percent * (progress_end - progress_start)
+                        # Update less frequently for speed
+                        if i % 5 == 0 or i == total_items - 1:
+                             self._update_status(f"Deleting old mods... ({i+1}/{total_items})", progress=current_gui_progress)
+
+                except Exception as e:
+                    items_failed += 1
+                    logging.error(f"Failed to delete {item}: {e}")
+
+            if items_failed > 0:
+                logging.error(f"Failed to delete {items_failed} items in mods folder.")
+                self._update_status(f"Error: Could not delete all old mods (failed: {items_failed}). Check permissions.", progress=progress_start, is_error=True)
+                return False
+            else:
+                logging.info(f"Successfully deleted {items_deleted} items from mods folder.")
+                self._update_status("Old mods deleted.", progress=progress_end)
+                return True
+        except Exception as e:
+            logging.exception(f"Error listing items in mods folder for clearing: {e}")
+            self._update_status(f"Error clearing mods folder: {e}", progress=progress_start, is_error=True)
+            return False
+
+    def _adjust_nested_mod_directory(self):
+        """Checks for and corrects a common issue where mods are extracted into a single subfolder."""
+        try:
+            mods_dir_items = list(self.mods_dir.iterdir())
+            if len(mods_dir_items) == 1 and mods_dir_items[0].is_dir():
+                nested_dir = mods_dir_items[0]
+                logging.warning(f"Detected single nested directory: {nested_dir.name}. Moving contents up.")
+                self._update_status("Adjusting nested mod directory structure...")
+                moved_count = 0
+                for item in nested_dir.iterdir():
+                    try:
+                        target_path = self.mods_dir / item.name
+                        shutil.move(str(item), str(target_path))
+                        moved_count += 1
+                    except Exception as move_e:
+                        logging.error(f"Failed to move item {item.name} from nested directory: {move_e}")
+                logging.info(f"Moved {moved_count} items from {nested_dir.name} to {self.mods_dir}.")
+                try:
+                    nested_dir.rmdir()
+                    logging.info(f"Removed empty nested directory: {nested_dir.name}")
+                except OSError as rmdir_e:
+                    logging.warning(f"Could not remove nested directory {nested_dir.name}: {rmdir_e}")
+            else:
+                logging.info("Mods directory structure seems correct.")
+        except Exception as structure_check_e:
+            logging.exception(f"Error checking/adjusting mod directory structure: {structure_check_e}")
+
+    def _launch_minecraft(self, version_id: str, nickname: str) -> bool:
+        """Launches Minecraft using the specified version ID and nickname."""
+        task_name = "Launch Minecraft"
+        logging.info(f"Starting task: {task_name}")
+        self._update_status(f"Preparing to launch Minecraft {version_id}...", progress=96)
+        logging.info(f"Preparing launch for version='{version_id}', nickname='{nickname}'")
+
+        # Start with JVM args from remote config, if any
+        jvm_args = self.launcher_config.get("jvm_args", [])
+        if not isinstance(jvm_args, list): # Ensure it's a list
+             logging.warning(f"Invalid jvm_args format in remote config ({type(jvm_args)}), using empty list.")
+             jvm_args = []
+
+        # Get Max RAM setting from local config
+        max_ram_setting = self.local_config.get("max_ram", "4G").strip().upper()
+        if re.match(r"^\d+[GM]$", max_ram_setting):
+             # Remove any existing -Xmx argument
+             jvm_args = [arg for arg in jvm_args if not arg.startswith("-Xmx")]
+             # Add the new -Xmx argument from settings
+             jvm_args.append(f"-Xmx{max_ram_setting}")
+             logging.info(f"Applied Max RAM setting: -Xmx{max_ram_setting}")
+        else:
+             logging.warning(f"Invalid max_ram setting '{max_ram_setting}' in local config. Using default JVM args.")
 
 
-def _launch_minecraft(version_id, nickname):
-    """Launches Minecraft using the specified version ID and nickname."""
-    update_status(f"Preparing to launch Minecraft {version_id}...", progress=96)
-    logging.info(f"Preparing launch for version='{version_id}', nickname='{nickname}'")
+        options = {
+            "username": nickname,
+            "uuid": str(uuid.uuid3(uuid.NAMESPACE_DNS, nickname)), # Offline mode UUID
+            "token": "0", # Offline mode token
+            "jvmArguments": jvm_args
+            # Add "gameDirectory": str(INSTANCE_DIR) here if implementing instance dirs
+        }
+        logging.info(f"Using launch options: {options}")
 
-    options = {
-        "username": nickname,
-        "uuid": str(uuid.uuid3(uuid.NAMESPACE_DNS, nickname)), # Offline mode UUID
-        "token": "0", # Offline mode token
-        # Use jvm_args from remote config if specified, otherwise default empty list
-        "jvmArguments": launcher_config.get("jvm_args", [])
-    }
-    logging.info(f"Using launch options: {options}")
+        try:
+            minecraft_command = minecraft_launcher_lib.command.get_minecraft_command(version_id, str(self.minecraft_dir), options)
+            logging.info(f"Generated Minecraft command: {' '.join(minecraft_command)}")
+        except Exception as e:
+            logging.exception(f"Error creating launch command for {version_id}: {e}")
+            self._update_status(f"Error preparing launch command: {e}", is_error=True)
+            logging.error(f"Task failed: {task_name} (command generation)")
+            return False
 
-    try:
-        minecraft_command = minecraft_launcher_lib.command.get_minecraft_command(version_id, str(MINECRAFT_DIR), options)
-        logging.info(f"Generated Minecraft command: {' '.join(minecraft_command)}")
-    except Exception as e:
-        # This could happen if the version metadata is corrupted/missing
-        logging.exception(f"Error creating launch command for {version_id}: {e}")
-        update_status(f"Error preparing launch command: {e}", is_error=True)
-        return False
+        self._update_status(f"Launching Minecraft as {nickname}...", progress=98)
+        try:
+            # Use Popen for non-blocking launch
+            subprocess.Popen(minecraft_command, cwd=str(self.minecraft_dir)) # Run in mc dir context
+            logging.info("Minecraft process started.")
+            self._update_status("Minecraft launched! You can close this launcher.", progress=100)
+            logging.info(f"Task finished successfully: {task_name}")
+            return True
+        except FileNotFoundError:
+            logging.error("Launch failed: 'java' command not found. Is Java installed and in PATH?")
+            self._update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", is_error=True)
+            logging.error(f"Task failed: {task_name} (Java not found)")
+            return False
+        except Exception as e:
+            logging.exception(f"An unexpected error occurred during Minecraft launch: {e}")
+            self._update_status(f"Error launching Minecraft: {e}", is_error=True)
+            logging.error(f"Task failed: {task_name} (launch exception)")
+            return False
 
-    update_status(f"Launching Minecraft as {nickname}...", progress=98)
-    try:
-        subprocess.Popen(minecraft_command)
-        logging.info("Minecraft process started.")
-        update_status("Minecraft launched! You can close this launcher.", progress=100)
-        # Consider closing the launcher automatically after a delay?
-        # root.after(5000, root.destroy)
-        return True
-    except FileNotFoundError:
-        # This typically means 'java' wasn't found in the PATH
-        logging.error("Launch failed: 'java' command not found. Is Java installed and in PATH?")
-        update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", is_error=True)
-        return False
-    except Exception as e:
-        logging.exception(f"An unexpected error occurred during Minecraft launch: {e}")
-        update_status(f"Error launching Minecraft: {e}", is_error=True)
-        return False
+    # --- Main Execution Method ---
+    def run_tasks(self, nickname: str):
+        """
+        Orchestrates the entire install/update/launch process.
+
+        Args:
+            nickname: The player nickname to use.
+        """
+        logging.info("="*20 + " Starting Action Sequence " + "="*20)
+        overall_success = False
+        try:
+            # --- Define Progress Ranges (Total 100%) ---
+            # Initial steps: 0-12%
+            fetch_config_start, fetch_config_end = 0.0, 10.0
+            ensure_dirs_start, ensure_dirs_end = 10.0, 12.0
+            # Installation steps: 12-95% (83% total)
+            vanilla_install_start, vanilla_install_end = 12.0, 35.0 # 23%
+            loader_install_start, loader_install_end = 35.0, 60.0 # 25%
+            modpack_update_start, modpack_update_end = 60.0, 95.0 # 35%
+            # Final steps: 95-100%
+            save_config_start, save_config_end = 95.0, 96.0 # 1%
+            launch_start, launch_end = 96.0, 100.0 # 4%
+
+            # 1. Validate and Save Nickname (Initial Step - No progress bar update needed here)
+            if not self.save_local_config(nickname):
+                self._update_status("Error: Nickname cannot be empty or save failed.", is_error=True)
+                logging.error("Action aborted: Failed to save local config.")
+                return # Exit function early
+            logging.info(f"Using nickname: {nickname}")
+
+            # 2. Fetch Remote Config
+            # Progress handled internally by fetch_launcher_config (sets 5% -> 10%)
+            if not self.fetch_launcher_config():
+                logging.error("Action aborted: Failed to fetch remote config.")
+                return
+
+            # 3. Ensure Directories Exist
+            # Progress handled internally by _ensure_directories (sets 12%)
+            if not self._ensure_directories():
+                logging.error("Action aborted: Failed to ensure directories.")
+                return
+
+            # 4. Get Config Details
+            mc_version = self.launcher_config.get("mc_version")
+            raw_loader_type = self.launcher_config.get("loader_type")
+            loader_type = str(raw_loader_type).lower() if raw_loader_type is not None else ""
+            loader_version = self.launcher_config.get("loader_version")
+            mods_url = self.launcher_config.get("mods_url")
+            gist_launcher_version = self.launcher_config.get("launcher_version", 0)
+            version_name = self.launcher_config.get("version_name", f"{mc_version} ({loader_type or 'Vanilla'})")
+
+            logging.info(f"Configuration: MC={mc_version}, Loader={loader_type} {loader_version}, Modpack Version={gist_launcher_version}, Name={version_name}")
+
+            if not mc_version:
+                self._update_status("Error: 'mc_version' missing in remote config.", is_error=True)
+                logging.error("Action aborted: 'mc_version' missing.")
+                return
+
+            self._update_status(f"Preparing: {version_name}", progress=ensure_dirs_end) # Show status after dirs check
+
+            # 5. Install Vanilla Minecraft
+            if not self._install_minecraft_version(mc_version, vanilla_install_start, vanilla_install_end):
+                logging.error(f"Action aborted: Failed to install/verify Minecraft {mc_version}.")
+                return # Exit function early
+
+            # 6. Install Loader (Forge/Fabric)
+            version_id_to_launch = mc_version # Default to vanilla
+            if loader_type == "forge" and loader_version:
+                version_id_to_launch = self._install_forge(mc_version, loader_version, loader_install_start, loader_install_end)
+                if not version_id_to_launch:
+                    logging.error(f"Action aborted: Failed to install Forge {loader_version}.")
+                    return # Exit function early
+            elif loader_type == "fabric" and loader_version:
+                version_id_to_launch = self._install_fabric(mc_version, loader_version, loader_install_start, loader_install_end)
+                if not version_id_to_launch:
+                    logging.error(f"Action aborted: Failed to install Fabric {loader_version}.")
+                    return # Exit function early
+            else:
+                self._update_status("No Mod Loader needed.", progress=loader_install_end) # Skip loader progress range
+                logging.info("No loader specified or required. Using Vanilla.")
+
+            # 7. Check/Update Modpack
+            if not self._update_modpack(mods_url, gist_launcher_version, modpack_update_start, modpack_update_end):
+                logging.error("Action aborted: Failed to update modpack.")
+                return # Exit function early
+
+            # 8. Save Config (with potentially updated version number from modpack)
+            # Do this *after* all install/update steps succeed but *before* launch
+            self._update_status("Saving configuration...", progress=save_config_start)
+            if not self.save_local_config(nickname):
+                 # Log warning, but don't necessarily abort launch
+                 logging.warning("Failed to save updated local config before launch.")
+                 self._update_status("Warning: Failed to save config.", progress=save_config_start, is_error=True)
+            self._update_status("Configuration saved.", progress=save_config_end)
+
+            # 9. Launch Game
+            # Progress handled internally by _launch_minecraft (96% -> 100%)
+            if not self._launch_minecraft(version_id_to_launch, nickname):
+                logging.error("Action aborted: Failed to launch Minecraft.")
+                # Button will be re-enabled by finally block
+            else:
+                logging.info("Launch sequence completed successfully.")
+                overall_success = True # Mark success for finally block
+
+        except Exception as e:
+            logging.exception("An unexpected error occurred during the main action sequence.")
+            self._update_status(f"An unexpected error occurred: {e}", is_error=True)
+
+        finally:
+            logging.info("="*20 + " Action Sequence Finished " + "="*20)
+            # Return success status to potentially re-enable button in GUI
+            return overall_success
 
 
-# --- Main Action Function ---
+# --- GUI Application ---
 
-def perform_install_update_launch():
-    """The main logic sequence, orchestrating the steps."""
-    action_button.config(state=tk.DISABLED)
-    update_status("Starting process...", progress=0)
-    logging.info("="*20 + " Starting Action " + "="*20)
+class LauncherApp:
+    """The main Tkinter GUI application."""
 
-    try:
-        # 1. Validate and Save Nickname
-        nickname = nickname_var.get().strip()
+    def __init__(self, root_window):
+        self.root = root_window
+        self.core = LauncherCore(self.update_status_display) # Pass GUI update method
+
+        # GUI State
+        self.settings_frame_visible = False
+
+        self._setup_styles()
+        self._setup_gui()
+        self._load_initial_config() # This will now also load Gist URL/RAM for the settings panel
+
+    def _setup_styles(self):
+        """Configures styles for GUI elements."""
+        self.style = ttk.Style()
+        # Configure TProgressbar style
+        self.style.theme_use('clam') # Experiment with 'clam', 'alt', 'default', 'classic'
+        self.style.configure("green.Horizontal.TProgressbar",
+                             troughcolor=ENTRY_BG, bordercolor=ENTRY_BG,
+                             background=BUTTON_BG, lightcolor=BUTTON_BG, darkcolor=BUTTON_BG)
+
+        # Configure default font
+        default_font = tkFont.nametofont("TkDefaultFont")
+        default_font.configure(family=FONT_FAMILY, size=FONT_SIZE_NORMAL)
+        self.root.option_add("*Font", default_font)
+
+    def _setup_gui(self):
+        """Creates and arranges the GUI widgets."""
+        self.root.title("Minecraft Launcher")
+        # Adjust initial size slightly to accommodate potential settings panel
+        self.root.geometry("850x600")
+        self.root.configure(bg=BG_COLOR)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close) # Handle window close
+
+        # --- Main Content Area ---
+        # Use PanedWindow to allow resizing between main content and settings
+        self.paned_window = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, bg=BG_COLOR, bd=0)
+        self.paned_window.pack(fill=tk.BOTH, expand=True)
+
+        # --- Left Frame (Main Controls) ---
+        left_frame = tk.Frame(self.paned_window, bg=BG_COLOR, width=500) # Give it an initial width
+        left_frame.pack(fill=tk.BOTH, expand=True)
+        self.paned_window.add(left_frame, stretch="always")
+
+        # --- Input Section (inside left_frame) ---
+        input_frame = tk.Frame(left_frame, bg=BG_COLOR)
+        # Use pack within the left frame for centering vertically
+        input_frame.pack(pady=(100, 20), padx=20) # Adjust padding
+
+        nickname_label = tk.Label(input_frame, text="Nickname:", bg=BG_COLOR, fg=FG_COLOR, font=(FONT_FAMILY, FONT_SIZE_LARGE))
+        nickname_label.pack(pady=(10, 5))
+
+        self.nickname_var = tk.StringVar()
+        self.nickname_entry = tk.Entry(input_frame, textvariable=self.nickname_var, width=35, # Slightly narrower
+                                       bg=ENTRY_BG, fg=ENTRY_FG, relief=tk.FLAT,
+                                       insertbackground=ENTRY_FG, font=(FONT_FAMILY, FONT_SIZE_NORMAL))
+        self.nickname_entry.pack(pady=(0, 20))
+
+        # --- Action Button (inside left_frame) ---
+        self.action_button = tk.Button(left_frame, text="Install / Play / Update",
+                                       command=self.start_action_thread,
+                                       bg=BUTTON_BG, fg=BUTTON_FG, relief=tk.FLAT,
+                                       activebackground=BUTTON_ACTIVE_BG, activeforeground=BUTTON_FG,
+                                       font=(FONT_FAMILY, FONT_SIZE_LARGE), padx=20, pady=10)
+        self.action_button.pack(pady=20) # Pack below input frame
+
+        # --- Settings Toggle Button (Top Right of left_frame) ---
+        settings_button = tk.Button(left_frame, text="⚙️ Settings",
+                                    command=self.toggle_settings_frame,
+                                    bg=BG_COLOR, fg=FG_COLOR, relief=tk.FLAT,
+                                    activebackground=ENTRY_BG, activeforeground=FG_COLOR,
+                                    font=(FONT_FAMILY, FONT_SIZE_NORMAL-1), bd=0)
+        # Place it at the top-right corner of the left frame
+        settings_button.place(relx=1.0, rely=0.0, x=-10, y=10, anchor=tk.NE)
+
+
+        # --- Right Frame (Settings Panel - Initially hidden or added later) ---
+        self.settings_frame = tk.Frame(self.paned_window, bg=ENTRY_BG, width=300) # Give initial width
+        # Don't pack or add it initially, toggle function will handle it
+        # self.paned_window.add(self.settings_frame, stretch="never") # Add but hide initially? Or add on toggle?
+
+        # --- Settings Panel Content (inside self.settings_frame) ---
+        settings_content_frame = tk.Frame(self.settings_frame, bg=ENTRY_BG, padx=15, pady=15)
+        settings_content_frame.pack(fill=tk.BOTH, expand=True)
+
+        settings_title = tk.Label(settings_content_frame, text="Settings", bg=ENTRY_BG, fg=FG_COLOR, font=(FONT_FAMILY, FONT_SIZE_LARGE))
+        settings_title.pack(pady=(0, 15))
+
+        # Gist URL
+        gist_label = tk.Label(settings_content_frame, text="Config Gist URL:", bg=ENTRY_BG, fg=FG_COLOR)
+        gist_label.pack(anchor=tk.W)
+        self.gist_url_var = tk.StringVar()
+        gist_entry = tk.Entry(settings_content_frame, textvariable=self.gist_url_var, width=35,
+                              bg=BG_COLOR, fg=ENTRY_FG, relief=tk.FLAT, insertbackground=ENTRY_FG)
+        gist_entry.pack(pady=(2, 10), fill=tk.X)
+
+        # Max RAM
+        ram_label = tk.Label(settings_content_frame, text="Max RAM (e.g., 4G):", bg=ENTRY_BG, fg=FG_COLOR)
+        ram_label.pack(anchor=tk.W)
+        self.max_ram_var = tk.StringVar()
+        ram_entry = tk.Entry(settings_content_frame, textvariable=self.max_ram_var, width=10,
+                             bg=BG_COLOR, fg=ENTRY_FG, relief=tk.FLAT, insertbackground=ENTRY_FG)
+        ram_entry.pack(pady=(2, 10), anchor=tk.W)
+
+        # Save Settings Button
+        save_button = tk.Button(settings_content_frame, text="Save Settings",
+                                command=self.save_settings,
+                                bg=BUTTON_BG, fg=BUTTON_FG, relief=tk.FLAT,
+                                activebackground=BUTTON_ACTIVE_BG, activeforeground=BUTTON_FG,
+                                font=(FONT_FAMILY, FONT_SIZE_NORMAL), padx=10, pady=5)
+        save_button.pack(pady=(15, 5))
+
+        # --- Status Section (at the bottom, below the PanedWindow) ---
+        status_frame = tk.Frame(self.root, bg=BG_COLOR)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=10)
+
+        self.status_var = tk.StringVar()
+        self.status_var.set("Ready.")
+        self.status_label = tk.Label(status_frame, textvariable=self.status_var, wraplength=760, # Adjust wrap?
+                                     bg=BG_COLOR, fg=FG_COLOR, justify=tk.LEFT,
+                                     font=(FONT_FAMILY, FONT_SIZE_NORMAL))
+        self.status_label.pack(pady=(5, 5), fill=tk.X)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(status_frame, variable=self.progress_var, maximum=100, length=760, style="green.Horizontal.TProgressbar")
+        self.progress_bar.pack(pady=(5, 10), fill=tk.X)
+
+
+    def _load_initial_config(self):
+        """Loads local config when the app starts and populates UI."""
+        loaded_config = self.core.load_local_config() # Core now returns the whole dict
+        self.nickname_var.set(loaded_config.get("nickname", ""))
+        self.gist_url_var.set(loaded_config.get("gist_url", CONFIG_URL)) # Use constant as default
+        self.max_ram_var.set(loaded_config.get("max_ram", "4G")) # Default to 4G
+
+    def update_status_display(self, message: str, progress: Optional[float] = None, is_error: bool = False):
+        """Updates the GUI status label and progress bar. Called by LauncherCore."""
+        self.status_var.set(message)
+        if progress is not None:
+            self.progress_var.set(progress)
+        # Change status label color on error
+        self.status_label.config(fg="red" if is_error else FG_COLOR)
+        self.root.update_idletasks() # Force GUI update
+
+    def toggle_settings_frame(self):
+        """Shows or hides the settings panel."""
+        if self.settings_frame_visible:
+            self.paned_window.remove(self.settings_frame)
+            self.settings_frame_visible = False
+        else:
+            # Add the frame to the paned window
+            # Add with stretch="never" so it doesn't resize automatically as much
+            self.paned_window.add(self.settings_frame, stretch="never", width=300)
+            self.settings_frame_visible = True
+            # Force redraw/update might be needed
+            self.root.update_idletasks()
+            # Try setting sash position after adding
+            # Note: Sash positions are tricky, might need adjustment or different approach
+            try:
+                 total_width = self.paned_window.winfo_width()
+                 sash_pos = total_width - 300 # Position sash for 300px settings panel
+                 if sash_pos > 0:
+                      self.paned_window.sash_place(0, sash_pos, 0)
+            except tk.TclError:
+                 logging.warning("Could not place sash for settings panel.")
+
+
+    def save_settings(self):
+        """Validates and saves the settings from the UI."""
+        nickname = self.nickname_var.get().strip() # Get current nickname too
+        gist_url = self.gist_url_var.get().strip()
+        max_ram = self.max_ram_var.get().strip().upper() # Standardize to uppercase
+
+        # Basic Validation
+        if not gist_url:
+            self.update_status_display("Error: Gist URL cannot be empty.", is_error=True)
+            return
+        if not max_ram:
+            self.update_status_display("Error: Max RAM cannot be empty.", is_error=True)
+            return
+        # Simple regex to check for number followed by G or M
+        if not re.match(r"^\d+[GM]$", max_ram):
+            self.update_status_display("Error: Invalid Max RAM format. Use e.g., '4G' or '1024M'.", is_error=True)
+            return
+
+        # Pass all settings to core save function
+        if self.core.save_local_config(nickname=nickname, gist_url=gist_url, max_ram=max_ram):
+            self.update_status_display("Settings saved successfully.")
+            # Optionally hide settings panel after save
+            # if self.settings_frame_visible:
+            #     self.toggle_settings_frame()
+        else:
+            # Error message should be set by core.save_local_config
+            pass
+
+    def start_action_thread(self):
+        """Starts the main installation/update/launch process in a separate thread."""
+        nickname = self.nickname_var.get().strip()
         if not nickname:
-            update_status("Error: Nickname cannot be empty.", is_error=True)
-            logging.error("Action aborted: Nickname is empty.")
-            return # Exit function early
-        if not save_local_config():
-            # Error message shown by save_local_config
-            logging.error("Action aborted: Failed to save local config.")
-            return # Exit function early
-        logging.info(f"Using nickname: {nickname}")
+            self.update_status_display("Error: Nickname cannot be empty.", is_error=True)
+            return
 
-        # 2. Fetch Remote Config
-        if not fetch_launcher_config():
-            # Error message shown by fetch_launcher_config
-            logging.error("Action aborted: Failed to fetch remote config.")
-            return # Exit function early
+        # Disable button immediately
+        self.action_button.config(state=tk.DISABLED)
+        self.update_status_display("Starting...", progress=0)
 
-        # 3. Ensure Directories Exist
-        if not _ensure_directories():
-            logging.error("Action aborted: Failed to ensure directories.")
-            return # Exit function early
+        # Create and start the background thread
+        action_thread = threading.Thread(
+            target=self._run_core_tasks_wrapper,
+            args=(nickname,),
+            daemon=True,
+            name="LauncherMainThread"
+        )
+        action_thread.start()
 
-        # 4. Get Config Details
-        mc_version = launcher_config.get("mc_version")
-        raw_loader_type = launcher_config.get("loader_type")
-        loader_type = str(raw_loader_type).lower() if raw_loader_type is not None else ""
-        loader_version = launcher_config.get("loader_version")
-        mods_url = launcher_config.get("mods_url")
-        gist_launcher_version = launcher_config.get("launcher_version", 0) # Default to 0 if missing
-        version_name = launcher_config.get("version_name", f"{mc_version} ({loader_type or 'Vanilla'})") # More descriptive default
+    def _run_core_tasks_wrapper(self, nickname: str):
+        """Wrapper function to run core tasks and handle button state."""
+        global root # Ensure root is accessible for scheduling
+        success = False # Default to failure
+        try:
+            success = self.core.run_tasks(nickname)
+        except Exception as e:
+            # Catch unexpected errors from the core logic itself
+            logging.exception("Unhandled exception in LauncherCore execution.")
+            # Ensure GUI update happens on main thread
+            if 'root' in globals():
+                 root.after(0, self.update_status_display, f"Critical Error: {e}", None, True)
+            else:
+                 self.update_status_display(f"Critical Error: {e}", None, True)
+            success = False # Ensure button is re-enabled on unexpected core error
 
-        logging.info(f"Configuration: MC={mc_version}, Loader={loader_type} {loader_version}, Modpack Version={gist_launcher_version}, Name={version_name}")
+        # Re-enable button ONLY if launch was not successful or an error occurred
+        if not success:
+            # Schedule button re-enable on the main thread
+            if 'root' in globals():
+                 root.after(0, lambda: self.action_button.config(state=tk.NORMAL))
 
-        if not mc_version:
-            update_status("Error: 'mc_version' missing in remote config.", is_error=True)
-            logging.error("Action aborted: 'mc_version' missing in remote config.")
-            return # Exit function early
-
-        update_status(f"Preparing to install/update: {version_name}", progress=11)
-
-        # 5. Install Vanilla Minecraft
-        if not _install_minecraft_version(mc_version):
-            logging.error(f"Action aborted: Failed to install/verify Minecraft {mc_version}.")
-            return # Exit function early
-
-        # 6. Install Loader (Forge/Fabric)
-        version_id_to_launch = mc_version # Default to vanilla
-        if loader_type == "forge" and loader_version:
-            version_id_to_launch = _install_forge(mc_version, loader_version)
-            if not version_id_to_launch:
-                logging.error(f"Action aborted: Failed to install Forge {loader_version}.")
-                return # Exit function early
-        elif loader_type == "fabric" and loader_version:
-            version_id_to_launch = _install_fabric(mc_version, loader_version)
-            if not version_id_to_launch:
-                logging.error(f"Action aborted: Failed to install Fabric {loader_version}.")
-                return # Exit function early
-        else:
-            update_status("Using Vanilla Minecraft.", progress=60)
-            logging.info("No loader specified or required. Using Vanilla.")
-
-        # 7. Check/Update Modpack
-        if not _update_modpack(mods_url, gist_launcher_version):
-            logging.error("Action aborted: Failed to update modpack.")
-            return # Exit function early
-
-        # 8. Launch Game
-        if not _launch_minecraft(version_id_to_launch, nickname):
-            logging.error("Action aborted: Failed to launch Minecraft.")
-            # Button will be re-enabled by finally block
-        else:
-            logging.info("Launch sequence completed successfully.")
-            # Optionally close launcher here?
-            # Keep button disabled on successful launch - user can close manually
-
-    except Exception as e:
-        # Catch any unexpected errors during the sequence
-        logging.exception("An unexpected error occurred during the main action sequence.")
-        update_status(f"An unexpected error occurred: {e}", is_error=True)
-        # Button will be re-enabled by finally block
-
-    finally:
-        # Final step: Re-enable button ONLY if launch was not successful or an error occurred
-        logging.info("="*20 + " Action Finished " + "="*20)
-        current_status = status_var.get()
-        if not current_status.startswith("Minecraft launched!"):
-            action_button.config(state=tk.NORMAL) # Re-enable on failure or error
+    def _on_close(self):
+        """Handles window closing action."""
+        logging.info("Launcher window closed by user.")
+        # Optional: Add cleanup here if needed (e.g., stop running threads gracefully)
+        self.root.destroy()
 
 
-def start_action_thread():
-    """Starts the main installation/update/launch process in a separate thread."""
-    # Disable button immediately to prevent double clicks
-    action_button.config(state=tk.DISABLED)
-    update_status("Starting...", progress=0) # Initial status
-
-    action_thread = threading.Thread(target=perform_install_update_launch, daemon=True)
-    action_thread.start()
+import re # Need regex for RAM validation
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    logging.info("Launcher application started.")
-    load_local_config()  # Load nickname/version on startup
+    root = tk.Tk()
+    app = LauncherApp(root)
     root.mainloop()
-    logging.info("Launcher application closed.")
+    logging.info("="*10 + " Launcher Exited " + "="*10)
