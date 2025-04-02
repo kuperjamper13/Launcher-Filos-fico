@@ -9,6 +9,7 @@ import subprocess
 import zipfile
 import gdown  # Dependency: pip install gdown
 import minecraft_launcher_lib  # Dependency: pip install minecraft-launcher-lib
+from minecraft_launcher_lib import runtime # Import the runtime module
 from pathlib import Path
 import uuid
 import logging
@@ -16,6 +17,7 @@ import time
 import shutil
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Optional, Dict, Any, List, Tuple, Callable
+import re # Need regex for RAM validation
 
 # --- Setup Logging ---
 log_file = Path("launcher.log")
@@ -412,6 +414,86 @@ class LauncherCore:
         logging.error(f"Task failed: Install {task_name}")
         return False # Definite failure
 
+    def _install_java_runtime(self, progress_start: float, progress_end: float, max_retries: int = 3, retry_delay: int = 5) -> Optional[str]:
+        """
+        Installs the required Java runtime using minecraft-launcher-lib.
+
+        Args:
+            progress_start: Starting percentage for this task.
+            progress_end: Ending percentage for this task.
+            max_retries: Max installation attempts.
+            retry_delay: Delay between retries.
+
+        Returns:
+            Path to the Java executable if successful, None otherwise.
+        """
+        task_name = "Java Runtime"
+        base_status = f"Installing {task_name}"
+        logging.info(f"Starting task: {base_status}")
+        self._set_task_progress_range(progress_start, progress_end, base_status)
+
+        last_exception = None
+        required_version = None
+        try:
+            # Determine the required version first (this shouldn't need retries)
+            required_version = runtime.get_jvm_runtime_version(str(self.minecraft_dir))
+            logging.info(f"Required Java runtime version: {required_version}")
+            base_status = f"Installing {task_name} ({required_version})" # Update base status with version
+            self._set_task_progress_range(progress_start, progress_end, base_status) # Update range with new status
+        except Exception as e:
+            logging.exception("Failed to determine required Java runtime version.")
+            self._update_status(f"Error determining Java version: {e}", progress=progress_start, is_error=True)
+            return None
+
+        for attempt in range(1, max_retries + 1):
+            logging.info(f"Attempt {attempt}/{max_retries} to install {task_name}...")
+            if attempt > 1:
+                self._update_status(f"Retrying {base_status} (Attempt {attempt}/{max_retries})...", progress=progress_start)
+                time.sleep(retry_delay)
+            else:
+                self._update_status(f"{base_status} (Attempt 1/{max_retries})...", progress=progress_start)
+
+            try:
+                logging.info(f"Calling runtime.install_jvm_runtime for {required_version} with max_workers=4 (Attempt {attempt})")
+                runtime.install_jvm_runtime(
+                    required_version,
+                    str(self.minecraft_dir),
+                    callback=self.lib_callbacks,
+                    max_workers=4 # Limit concurrent downloads
+                )
+                logging.info(f"Finished install call for {task_name} on attempt {attempt}.")
+                self._update_status(f"{task_name} installation complete.", progress=progress_end)
+
+                # Verify and get path
+                try:
+                    java_path = runtime.get_executable_path(required_version, str(self.minecraft_dir))
+                    if java_path and Path(java_path).exists():
+                        logging.info(f"Java executable verified at: {java_path}")
+                        logging.info(f"Task finished successfully: Install {task_name}")
+                        return java_path
+                    else:
+                        raise runtime.RuntimeNotFound("Executable path not found or invalid after install.")
+                except runtime.RuntimeNotFound as verify_e:
+                     last_exception = verify_e
+                     logging.error(f"Java install seemed to succeed, but verification failed: {verify_e}")
+                     # Fall through to error handling
+
+            except Exception as e:
+                 last_exception = e
+                 logging.warning(f"Attempt {attempt} failed for installing {task_name}: {e}")
+                 self._update_status(f"Attempt {attempt} failed for {base_status}: {e}", progress=progress_start, is_error=True)
+
+        # --- All attempts failed ---
+        logging.error(f"All {max_retries} attempts to install {task_name} failed.")
+        error_msg = f"Failed to install {task_name}"
+        if last_exception:
+            logging.exception(f"Last error during {task_name} install attempt: {last_exception}")
+            error_msg += f": {last_exception}"
+        self._update_status(error_msg, progress=progress_start, is_error=True)
+        logging.error(f"Task failed: Install {task_name}")
+        return None
+
+
     def _install_forge(self, mc_version: str, loader_version: str, progress_start: float, progress_end: float) -> Optional[str]:
         """
         Installs Forge using the official installer with progress updates.
@@ -431,6 +513,16 @@ class LauncherCore:
         logging.info(f"Starting task: {base_status}")
         self._update_status(f"{base_status}...", progress=progress_start) # Initial status
 
+        # --- Check if Forge version is already installed ---
+        try:
+            installed_versions = minecraft_launcher_lib.utils.get_installed_versions(str(self.minecraft_dir))
+            if any(v['id'] == version_id for v in installed_versions):
+                logging.info(f"{task_name} version {version_id} is already installed.")
+                self._update_status(f"{task_name} already installed.", progress=progress_end) # Mark as complete
+                return version_id # Skip installation
+        except Exception as check_e:
+            logging.warning(f"Could not check for existing Forge versions: {check_e}. Proceeding with installation attempt.")
+
         installer_filename = f"forge-{mc_version}-{loader_version}-installer.jar"
         installer_path = self.minecraft_dir / installer_filename
         installer_url = f"https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_version}-{loader_version}/{installer_filename}"
@@ -442,12 +534,28 @@ class LauncherCore:
         verify_start, verify_end = install_end, progress_end # Rest for verify
 
         # --- Pre-flight Checks ---
-        java_path = shutil.which('java')
+        # Use the library-managed Java runtime if available
+        java_path = None
+        try:
+            # Try to get the path to the Java runtime managed by the library
+            # This assumes _install_java_runtime was called successfully beforehand in run_tasks
+            required_java_version = runtime.get_jvm_runtime_version(str(self.minecraft_dir))
+            java_path = runtime.get_executable_path(required_java_version, str(self.minecraft_dir))
+            if not java_path or not Path(java_path).exists():
+                 logging.warning(f"Managed Java runtime ({required_java_version}) path not found or invalid: {java_path}. Falling back to system PATH search.")
+                 java_path = None # Reset to trigger fallback to shutil.which
+        except Exception as e:
+            logging.warning(f"Could not determine or find managed Java path, falling back to system PATH search: {e}")
+            java_path = None
+
         if not java_path:
-            logging.error("Forge install check failed: 'java' command not found.")
-            self._update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", progress=progress_start, is_error=True)
+             java_path = shutil.which('java') # Fallback: search system PATH
+
+        if not java_path: # If still not found after checking managed runtime and PATH
+            logging.error("Forge install check failed: Java executable not found in managed runtime or system PATH.")
+            self._update_status("Error: Java not found. Please install Java or ensure the launcher can download it.", progress=progress_start, is_error=True)
             return None
-        logging.info(f"Java executable found at: {java_path}")
+        logging.info(f"Using Java executable for Forge install: {java_path}")
 
         self._update_status(f"Checking {task_name} installer availability...", progress=check_start)
         logging.info(f"Checking Forge installer URL (HEAD): {installer_url}")
@@ -954,6 +1062,22 @@ class LauncherCore:
             "jvmArguments": jvm_args
             # Add "gameDirectory": str(INSTANCE_DIR) here if implementing instance dirs
         }
+
+        # Get managed Java path for launch
+        java_executable_path = None
+        try:
+            # Try to get the path to the Java runtime managed by the library
+            # This assumes _install_java_runtime was called successfully beforehand in run_tasks
+            required_java_version = runtime.get_jvm_runtime_version(str(self.minecraft_dir))
+            java_executable_path = runtime.get_executable_path(required_java_version, str(self.minecraft_dir))
+            if java_executable_path and Path(java_executable_path).exists():
+                 options["executablePath"] = java_executable_path # Set the specific Java executable
+                 logging.info(f"Using managed Java runtime for launch: {java_executable_path}")
+            else:
+                 logging.warning(f"Managed Java runtime ({required_java_version}) path not found or invalid: {java_executable_path}. Relying on default launch behavior (system PATH or older bundled).")
+        except Exception as e:
+            logging.warning(f"Could not determine or find managed Java path for launch, relying on default launch behavior: {e}")
+
         logging.info(f"Using launch options: {options}")
 
         try:
@@ -974,8 +1098,9 @@ class LauncherCore:
             logging.info(f"Task finished successfully: {task_name}")
             return True
         except FileNotFoundError:
-            logging.error("Launch failed: 'java' command not found. Is Java installed and in PATH?")
-            self._update_status("Error: Java not found. Please install Java and ensure it's in your PATH.", is_error=True)
+            # This error should be less likely now if managed Java is used, but keep fallback message
+            logging.error("Launch failed: Java executable not found. Is Java installed or did the download fail?")
+            self._update_status("Error: Java not found. Please install Java or check logs for download errors.", is_error=True)
             logging.error(f"Task failed: {task_name} (Java not found)")
             return False
         except Exception as e:
@@ -997,12 +1122,13 @@ class LauncherCore:
         try:
             # --- Define Progress Ranges (Total 100%) ---
             # Initial steps: 0-12%
-            fetch_config_start, fetch_config_end = 0.0, 10.0
-            ensure_dirs_start, ensure_dirs_end = 10.0, 12.0
-            # Installation steps: 12-95% (83% total)
+            fetch_config_start, fetch_config_end = 0.0, 10.0 # 10%
+            ensure_dirs_start, ensure_dirs_end = 10.0, 12.0 # 2%
+            # Installation steps: 12-95% (83% total) - Reallocated for Java step
             vanilla_install_start, vanilla_install_end = 12.0, 35.0 # 23%
-            loader_install_start, loader_install_end = 35.0, 60.0 # 25%
-            modpack_update_start, modpack_update_end = 60.0, 95.0 # 35%
+            java_install_start, java_install_end = 35.0, 55.0 # 20% (Give Java install decent time)
+            loader_install_start, loader_install_end = 55.0, 75.0 # 20%
+            modpack_update_start, modpack_update_end = 75.0, 95.0 # 20%
             # Final steps: 95-100%
             save_config_start, save_config_end = 95.0, 96.0 # 1%
             launch_start, launch_end = 96.0, 100.0 # 4%
@@ -1049,14 +1175,26 @@ class LauncherCore:
                 logging.error(f"Action aborted: Failed to install/verify Minecraft {mc_version}.")
                 return # Exit function early
 
-            # 6. Install Loader (Forge/Fabric)
+            # 6. Install Java Runtime (Essential for running MC and potentially Forge installer)
+            # We attempt this even if Java is on PATH, to ensure the correct version is available for the library
+            java_executable_path = self._install_java_runtime(java_install_start, java_install_end)
+            if not java_executable_path:
+                 logging.error("Action aborted: Failed to install or verify the required Java Runtime.")
+                 # Don't necessarily exit here, launch might still work if system Java is compatible
+                 # But Forge install will likely fail if it was needed.
+                 # We'll let the Forge/Launch steps handle the final check.
+                 pass # Continue sequence, but expect potential failures later
+
+            # 7. Install Loader (Forge/Fabric)
             version_id_to_launch = mc_version # Default to vanilla
             if loader_type == "forge" and loader_version:
+                # _install_forge now internally tries to find the managed Java path first
                 version_id_to_launch = self._install_forge(mc_version, loader_version, loader_install_start, loader_install_end)
                 if not version_id_to_launch:
                     logging.error(f"Action aborted: Failed to install Forge {loader_version}.")
                     return # Exit function early
             elif loader_type == "fabric" and loader_version:
+                # Fabric install doesn't need separate Java path, uses library internals
                 version_id_to_launch = self._install_fabric(mc_version, loader_version, loader_install_start, loader_install_end)
                 if not version_id_to_launch:
                     logging.error(f"Action aborted: Failed to install Fabric {loader_version}.")
@@ -1065,22 +1203,23 @@ class LauncherCore:
                 self._update_status("No Mod Loader needed.", progress=loader_install_end) # Skip loader progress range
                 logging.info("No loader specified or required. Using Vanilla.")
 
-            # 7. Check/Update Modpack
+            # 8. Check/Update Modpack
             if not self._update_modpack(mods_url, gist_launcher_version, modpack_update_start, modpack_update_end):
                 logging.error("Action aborted: Failed to update modpack.")
                 return # Exit function early
 
-            # 8. Save Config (with potentially updated version number from modpack)
+            # 9. Save Config (with potentially updated version number from modpack)
             # Do this *after* all install/update steps succeed but *before* launch
             self._update_status("Saving configuration...", progress=save_config_start)
-            if not self.save_local_config(nickname):
+            # Save only nickname here, Gist URL/RAM are saved via settings panel
+            if not self.save_local_config(nickname=nickname):
                  # Log warning, but don't necessarily abort launch
-                 logging.warning("Failed to save updated local config before launch.")
+                 logging.warning("Failed to save updated local config (nickname/version) before launch.")
                  self._update_status("Warning: Failed to save config.", progress=save_config_start, is_error=True)
             self._update_status("Configuration saved.", progress=save_config_end)
 
-            # 9. Launch Game
-            # Progress handled internally by _launch_minecraft (96% -> 100%)
+            # 10. Launch Game
+            # _launch_minecraft now internally tries to find the managed Java path
             if not self._launch_minecraft(version_id_to_launch, nickname):
                 logging.error("Action aborted: Failed to launch Minecraft.")
                 # Button will be re-enabled by finally block
@@ -1345,8 +1484,6 @@ class LauncherApp:
         # Optional: Add cleanup here if needed (e.g., stop running threads gracefully)
         self.root.destroy()
 
-
-import re # Need regex for RAM validation
 
 # --- Main Execution ---
 if __name__ == "__main__":
